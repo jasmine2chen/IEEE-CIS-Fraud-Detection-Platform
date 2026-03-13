@@ -6,6 +6,8 @@ from src.data_prep.data_loader import prepare_data
 from src.features.build_features import build_features, get_feature_pipeline
 from src.models.tree_models import get_xgboost_model
 from sklearn.metrics import roc_auc_score
+import joblib
+import os
 
 def time_consistency_split(df: pd.DataFrame, train_months: int = 1, test_month_offset: int = 5):
     """
@@ -67,6 +69,12 @@ def train(trans_path: str, id_path: str):
         
         # Determine if we should keep specific engineered features based on AUC delta
         # (This is where the iterative column dropping would happen)
+        
+        print("Serializing Model and Preprocessing Pipeline Artifacts...")
+        os.makedirs("models", exist_ok=True)
+        joblib.dump(pipeline, "models/feature_pipeline.joblib")
+        joblib.dump(model, "models/xgboost_fraud_model.joblib")
+        print("Export complete. Artifacts saved in models/ directory.")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
