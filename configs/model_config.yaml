@@ -1,0 +1,40 @@
+version: "1.0.0"
+
+data:
+  train_data_path: "data/raw/train_transaction.csv"
+  train_identity_path: "data/raw/train_identity.csv"
+  test_data_path: "data/raw/test_transaction.csv"
+  test_identity_path: "data/raw/test_identity.csv"
+  processed_dir: "data/processed"
+
+model:
+  type: "xgboost" # Option: 'pytorch_mlp'
+  target_col: "isFraud"
+  random_state: 42
+  
+xgboost_params:
+  n_estimators: 500
+  learning_rate: 0.05
+  max_depth: 9
+  subsample: 0.8
+  colsample_bytree: 0.8
+  eval_metric: "auc"
+  tree_method: "hist"
+
+pytorch_params:
+  hidden_dim: 256
+  dropout_rate: 0.3
+  batch_size: 1024
+  learning_rate: 0.001
+  epochs: 50
+  
+training:
+  cv_strategy: "time_consistency" # Month 1 -> Predict Month 6
+  early_stopping_rounds: 50
+  mlflow_experiment_name: "fraud_detection_ieee"
+  mlflow_tracking_uri: "sqlite:///mlruns.db"
+
+serving:
+  host: "0.0.0.0"
+  port: 8000
+  fraud_threshold_prob: 0.85
