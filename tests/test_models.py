@@ -1,70 +1,82 @@
+import numpy as np
 import pytest
 import torch
-import numpy as np
-import pandas as pd
-from src.models.pytorch_mlp import FraudMLP, FocalLoss
-from src.models.train_nn import train_nn, EarlyStopping
 
-def test_fraud_mlp_forward():
-    """Test the forward pass of the PyTorch MLP architecture."""
-    input_dim = 10
-    batch_size = 4
-    model = FraudMLP(input_dim=input_dim, hidden_dim=32, dropout_rate=0.1)
-    
-    # Create dummy tensor
-    x = torch.randn(batch_size, input_dim)
-    
-    # Forward pass
+from src.models.mlp_tree import EarlyStopping, FocalLoss, MLPEncoder, train_mlp_xgboost
+
+
+def test_mlp_encoder_forward():
+    """Forward pass produces correct output shape [N, last_hidden_dim]."""
+    model = MLPEncoder(input_dim=10, hidden_dims=[32, 16], dropout_rate=0.1)
+    x = torch.randn(4, 10)
     output = model(x)
-    
-    # Assert output shape is (batch_size, 1)
-    assert output.shape == (batch_size, 1)
+    assert output.shape == (4, 16)
+
 
 def test_focal_loss():
-    """Test Focal Loss computation."""
+    """FocalLoss returns a positive scalar."""
     criterion = FocalLoss(alpha=0.25, gamma=2.0)
-    
-    # Dummy logits and targets
-    logits = torch.tensor([0.0, 2.0, -2.0])
-    targets = torch.tensor([1.0, 1.0, 0.0])
-    
+    logits  = torch.tensor([0.0, 2.0, -2.0])
+    targets = torch.tensor([1.0, 1.0,  0.0])
     loss = criterion(logits, targets)
-    
-    # Loss should be a scalar tensor
     assert loss.dim() == 0
     assert loss.item() > 0
 
-def test_train_nn_smoke():
-    """Smoke test to ensure the training loop runs without errors."""
+
+def test_train_mlp_xgboost_smoke():
+    """Smoke test: full MLP+XGBoost pipeline runs and returns two models."""
     np.random.seed(42)
     torch.manual_seed(42)
-    
-    # Dummy data
-    X_train = np.random.randn(100, 10).astype(np.float32)
-    y_train = np.random.randint(0, 2, size=(100,)).astype(np.float32)
-    X_val = np.random.randn(20, 10).astype(np.float32)
-    y_val = np.random.randint(0, 2, size=(20,)).astype(np.float32)
-    
-    # Train for 2 epochs
-    model = train_nn(X_train, y_train, X_val, y_val, epochs=2, batch_size=32, lr=0.01)
-    
-    assert isinstance(model, FraudMLP)
-    
+    X_train = np.random.randn(200, 10).astype(np.float32)
+    y_train = np.random.randint(0, 2, size=(200,)).astype(np.float32)
+    X_val   = np.random.randn(40,  10).astype(np.float32)
+    y_val   = np.random.randint(0, 2, size=(40,)).astype(np.float32)
+
+    params = {
+        "hidden_dims": [32, 16],
+        "dropout_rate": 0.1,
+        "learning_rate": 0.01,
+        "encoder_epochs": 2,
+        "batch_size": 32,
+        "patience": 5,
+        "n_estimators": 10,
+        "max_depth": 3,
+        "tree_method": "hist",
+    }
+    encoder, xgb_model = train_mlp_xgboost(
+        X_train, y_train, X_val, y_val,
+        params=params, save_path=None,
+    )
+    assert isinstance(encoder, MLPEncoder)
+    preds = xgb_model.predict_proba(
+        np.concatenate([X_val, encoder(torch.FloatTensor(X_val)).detach().numpy()], axis=1)
+    )
+    assert preds.shape == (40, 2)
+
+
 def test_early_stopping():
-    """Test early stopping logic."""
+    """EarlyStopping counter increments and triggers at patience."""
     es = EarlyStopping(patience=2, min_delta=0.01)
     model = torch.nn.Linear(10, 1)
-    
-    # Epoch 1: val_loss = 1.0
-    es(1.0, model)
+
+    es(1.0, model)           # first call — sets best
     assert not es.early_stop
     assert es.counter == 0
-    
-    # Epoch 2: val_loss = 1.0 (no improvement)
-    es(1.0, model)
+
+    es(1.0, model)           # no improvement
     assert not es.early_stop
     assert es.counter == 1
-    
-    # Epoch 3: val_loss = 1.0 (no improvement, should trigger stop)
-    es(1.0, model)
+
+    es(1.0, model)           # counter hits patience=2 → trigger
     assert es.early_stop
+
+
+def test_early_stopping_resets_on_improvement():
+    """Counter resets when the metric improves."""
+    es = EarlyStopping(patience=3)
+    model = torch.nn.Linear(10, 1)
+    es(1.0, model)
+    es(1.0, model)           # counter = 1
+    es(0.5, model)           # improvement — counter resets
+    assert es.counter == 0
+    assert not es.early_stop

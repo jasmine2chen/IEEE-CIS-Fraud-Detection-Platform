@@ -4,15 +4,22 @@ import numpy as np
 from fastapi.testclient import TestClient
 from api.main import app, get_prediction_artifacts
 
+class MockPipeline:
+    """Mimics a fitted sklearn Pipeline: accepts a raw DataFrame, returns a feature array."""
+    def transform(self, X: pd.DataFrame) -> np.ndarray:
+        return np.zeros((len(X), 10), dtype=np.float32)
+
 class MockModel:
-    def predict_proba(self, X: pd.DataFrame) -> np.ndarray:
-        return np.random.uniform(0, 1, size=(len(X), 2))
+    def predict_proba(self, X: np.ndarray) -> np.ndarray:
+        n = len(X)
+        fraud_probs = np.random.uniform(0, 1, size=n)
+        return np.column_stack([1 - fraud_probs, fraud_probs])
 
 def override_get_prediction_artifacts():
-    """Provides a safe mocked model & pipeline context so tests don't require actual disk I/O"""
+    """Mocked artifacts so tests don't require actual disk I/O."""
     return {
         "model": MockModel(),
-        "pipeline": None
+        "pipeline": MockPipeline(),
     }
 
 app.dependency_overrides[get_prediction_artifacts] = override_get_prediction_artifacts

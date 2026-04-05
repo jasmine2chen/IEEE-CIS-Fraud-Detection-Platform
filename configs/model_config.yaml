@@ -8,10 +8,10 @@ data:
   processed_dir: "data/processed"
 
 model:
-  type: "xgboost" # Option: 'pytorch_mlp'
+  type: "xgboost" # Options: xgboost, mlp_xgboost, gnn, transformer_xgboost
   target_col: "isFraud"
   random_state: 42
-  
+
 xgboost_params:
   n_estimators: 500
   learning_rate: 0.05
@@ -21,18 +21,127 @@ xgboost_params:
   eval_metric: "auc"
   tree_method: "hist"
 
-pytorch_params:
-  hidden_dim: 256
+gnn_params:
+  # GNN encoder (Stage 1)
+  hidden_dim: 128
+  num_layers: 2
+  dropout_rate: 0.3
+  learning_rate: 0.001
+  batch_size: 512
+  epochs: 50
+  patience: 7
+  num_neighbors: 10
+  time_window_days: 7.0   # Only connect transactions within 7 days — prevents concept drift
+  max_edges_per_node: 10  # Safety cap per entity column to prevent hub explosion
+  # XGBoost on enriched features (Stage 2)
+  n_estimators: 300
+  max_depth: 6
+  subsample: 0.8
+  colsample_bytree: 0.8
+  xgb_early_stopping_rounds: 30
+  tree_method: "hist"
+
+mlp_xgboost_params:
+  hidden_dims: [256, 128, 64]   # MLP encoder architecture — last dim = embedding size
   dropout_rate: 0.3
   batch_size: 1024
   learning_rate: 0.001
-  epochs: 50
-  
+  encoder_epochs: 20
+  patience: 5
+  n_estimators: 300
+  max_depth: 6
+  subsample: 0.8
+  colsample_bytree: 0.8
+  xgb_early_stopping_rounds: 30
+  tree_method: "hist"
+
+transformer_params:
+  d_token: 64
+  nhead: 4
+  num_layers: 2
+  dropout_rate: 0.1
+  learning_rate: 0.001
+  encoder_epochs: 30
+  batch_size: 1024
+  patience: 5
+  n_estimators: 300
+  max_depth: 6
+  subsample: 0.8
+  colsample_bytree: 0.8
+  xgb_early_stopping_rounds: 30
+  tree_method: "hist"
+
 training:
-  cv_strategy: "time_consistency" # Month 1 -> Predict Month 6
+  cv_strategy: "time_consistency" # Months 0-5 train -> Predict Month 6
   early_stopping_rounds: 50
   mlflow_experiment_name: "fraud_detection_ieee"
   mlflow_tracking_uri: "sqlite:///mlruns.db"
+
+xgboost_selected_features: null  # populated by tune.py XGBoost L1 RFE; null = use all features
+
+# Hybrid model outputs — populated by tune.py _run_hybrid_pipeline; null = use all features
+mlp_xgboost_stage2_params: null   # Phase B XGBoost params (trained on frozen MLP embeddings)
+mlp_xgboost_selected: null        # Phase B L2 RFE indices into [orig || mlp_embed] matrix
+transformer_stage2_params: null   # Phase B XGBoost params (trained on frozen Transformer CLS)
+transformer_xgboost_selected: null # Phase B L2 RFE indices into [orig || transformer_embed]
+gnn_stage2_params: null           # Phase B XGBoost params (trained on frozen GNN embeddings)
+gnn_selected: null                # Phase B L2 RFE indices into [orig || gnn_embed] matrix
+
+tuning:
+  n_trials: 50
+  xgboost:
+    study_name: "xgboost_fraud_tuning"
+    early_stopping_rounds: 50
+    # --- CV ---
+    cv_folds: 3                    # expanding-window folds (fold 0=oldest, fold n-1=most recent)
+    cv_fold_weights: [1, 2, 3]     # recency weights; len must equal cv_folds
+    # --- RFE ---
+    rfe_n_features_min: 20         # stop eliminating when this many features remain
+    rfe_step: 10                   # features dropped per RFE iteration
+    rfe_stability_k: 2.0           # k in UCB = mean_FPR + k*std_FPR (higher = more stability bias)
+    # --- Re-tune (Step 3) ---
+    retune_n_trials: 25            # Optuna trials for re-tune; default = max(n_trials//2, 20)
+    # --- Stability gate (Step 4) ---
+    variance_threshold: 0.03       # max allowed var(fold FPRs); warn if exceeded
+  mlp_xgboost:
+    study_name: "mlp_xgboost_fraud_tuning"
+    # Phase A: encoder HPO (single OOT — cheaper than CV since encoder training is expensive)
+    encoder_n_trials: 30
+    # Phase B: expanding-window CV for L2 RFE + XGBoost re-HPO
+    early_stopping_rounds: 50
+    cv_folds: 3
+    cv_fold_weights: [1, 2, 3]
+    rfe_step: 10
+    rfe_n_features_min: 20
+    rfe_stability_k: 2.0
+    retune_n_trials: 20
+    variance_threshold: 0.03
+  gnn:
+    study_name: "gnn_fraud_tuning"
+    # Phase A: encoder HPO
+    encoder_n_trials: 20          # fewer trials — GNN training is most expensive
+    # Phase B: same CV scheme as XGBoost/MLP
+    early_stopping_rounds: 50
+    cv_folds: 3
+    cv_fold_weights: [1, 2, 3]
+    rfe_step: 10
+    rfe_n_features_min: 20
+    rfe_stability_k: 2.0
+    retune_n_trials: 20
+    variance_threshold: 0.03
+  transformer_xgboost:
+    study_name: "transformer_xgboost_fraud_tuning"
+    # Phase A: encoder HPO
+    encoder_n_trials: 30
+    # Phase B
+    early_stopping_rounds: 50
+    cv_folds: 3
+    cv_fold_weights: [1, 2, 3]
+    rfe_step: 10
+    rfe_n_features_min: 20
+    rfe_stability_k: 2.0
+    retune_n_trials: 20
+    variance_threshold: 0.03
 
 serving:
   host: "0.0.0.0"

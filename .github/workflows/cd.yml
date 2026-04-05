@@ -1,0 +1,97 @@
+name: CD
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      model_type:
+        description: 'Model type to deploy'
+        required: false
+        default: 'xgboost'
+
+jobs:
+  integration-test:
+    name: Integration Tests
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run tests (excluding slow)
+        run: |
+          python -m pytest tests/ -v --tb=short -m "not slow"
+
+      - name: Registry import check
+        run: |
+          python -c "from src.registry import MODEL_NAME_MAP; print('registry ok')"
+
+  build-and-push:
+    name: Build & Push Docker Image
+    runs-on: ubuntu-latest
+    needs: integration-test
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Log in to Docker Hub
+        if: ${{ secrets.DOCKER_USERNAME != '' }}
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+
+      - name: Build Docker image
+        run: |
+          docker build \
+            -t ${{ secrets.DOCKER_USERNAME }}/fraud-detection-api:${{ github.sha }} \
+            -t ${{ secrets.DOCKER_USERNAME }}/fraud-detection-api:latest \
+            .
+
+      - name: Push Docker image
+        if: ${{ secrets.DOCKER_USERNAME != '' }}
+        run: |
+          docker push ${{ secrets.DOCKER_USERNAME }}/fraud-detection-api:${{ github.sha }}
+          docker push ${{ secrets.DOCKER_USERNAME }}/fraud-detection-api:latest
+
+  notify:
+    name: Deployment Notification
+    runs-on: ubuntu-latest
+    needs: build-and-push
+    if: always()
+
+    steps:
+      - name: Deployment summary
+        run: |
+          echo "=========================================="
+          echo "  Fraud Detection — Deployment Summary"
+          echo "=========================================="
+          echo "  Commit SHA : ${{ github.sha }}"
+          echo "  Branch     : ${{ github.ref_name }}"
+          echo "  Model type : ${{ github.event.inputs.model_type || 'xgboost' }}"
+          echo "  Timestamp  : $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          echo "  Status     : ${{ needs.build-and-push.result }}"
+          echo "=========================================="
+          echo ""
+          echo "Stub: replace with Slack webhook, PagerDuty event, or"
+          echo "      your preferred notification integration."
+          echo ""
+          echo "Example Slack step:"
+          echo "  uses: slackapi/slack-github-action@v1"
+          echo "  with:"
+          echo "    payload: '{\"text\": \"Deployed fraud-detection-api:${{ github.sha }}\"}'"
+          echo "  env:"
+          echo "    SLACK_WEBHOOK_URL: \${{ secrets.SLACK_WEBHOOK_URL }}"

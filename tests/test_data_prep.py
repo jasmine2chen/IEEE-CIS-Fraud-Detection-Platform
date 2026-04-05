@@ -5,7 +5,8 @@ from src.features.build_features import build_features
 def test_clean_data(sample_data):
     """Test data cleaning removes extreme NaNs."""
     import numpy as np
-    sample_data['extreme_missing'] = [np.nan, np.nan, np.nan, 1.0] 
+    n = len(sample_data)
+    sample_data['extreme_missing'] = [np.nan] * (n - 1) + [1.0]
     clean_df = clean_data(sample_data)
     assert 'extreme_missing' not in clean_df.columns
     assert 'TransactionAmt' in clean_df.columns

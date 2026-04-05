@@ -10,6 +10,29 @@ authors = [
     { name = "Jasmine Chen" }
 ]
 requires-python = ">=3.9"
+dependencies = [
+    "fastapi==0.128.8",
+    "uvicorn==0.39.0",
+    "scikit-learn==1.6.1",
+    "xgboost==2.1.4",
+    "torch==2.8.0",
+    "mlflow==3.1.4",
+    "pandas==2.3.3",
+    "numpy==2.0.2",
+    "pydantic==2.12.5",
+    "httpx==0.28.1",
+    "joblib==1.5.3",
+    "pyyaml==6.0.3",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest==8.4.2",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["src*", "api*"]
 
 [tool.mypy]
 python_version = "3.9"

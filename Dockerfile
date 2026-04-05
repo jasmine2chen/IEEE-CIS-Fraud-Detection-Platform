@@ -1,41 +1,43 @@
-# Python Backend Dockerfile
-FROM python:3.9-slim as builder
+# ----- Build stage -----
+FROM python:3.9-slim AS builder
 
-# Set working directory
 WORKDIR /app
 
-# Install system dependencies necessary for compiling C-extensions (like numpy/torch)
 RUN apt-get update && apt-get install -y \
     build-essential \
     curl \
-    software-properties-common \
     && rm -rf /var/lib/apt/lists/*
 
-# Install python dependencies strictly
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# --- Production Stage ---
+# ----- Production stage -----
 FROM python:3.9-slim
 
 WORKDIR /app
 
-# Copy installed dependencies from the builder image
+# Run as non-root for security
+RUN useradd --create-home appuser
+
+# Copy installed packages from builder
 COPY --from=builder /usr/local/lib/python3.9/site-packages /usr/local/lib/python3.9/site-packages
 COPY --from=builder /usr/local/bin /usr/local/bin
 
-# Copy Application logic
+# Copy application source
 COPY src/ ./src/
 COPY api/ ./api/
 COPY configs/ ./configs/
 
-# Expose FastAPI default port
+# Model artifacts are NOT baked into the image — mount them at runtime:
+#   docker run -v $(pwd)/models:/app/models fraud_detection_api:latest
+# This keeps the image reproducible and allows model updates without rebuilds.
+RUN mkdir -p /app/models && chown -R appuser:appuser /app
+
+USER appuser
+
 EXPOSE 8000
 
-# Specify environment vars
 ENV WORKERS=4
-ENV MODULE_NAME=api.main
-ENV VARIABLE_NAME=app
 
-# Start the uvicorn server serving the application
-CMD ["uvicorn", "api.main:app", "--host", "0.0.0.0", "--port", "8000"]
+# Use $WORKERS for horizontal concurrency; override at runtime with -e WORKERS=N
+CMD uvicorn api.main:app --host 0.0.0.0 --port 8000 --workers $WORKERS
