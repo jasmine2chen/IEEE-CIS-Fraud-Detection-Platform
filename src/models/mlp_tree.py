@@ -31,6 +31,7 @@ import os
 from typing import Any, Dict, List, Optional, Tuple
 
 import mlflow
+import mlflow.xgboost
 import numpy as np
 import torch
 import torch.nn as nn
@@ -431,7 +432,6 @@ def train_mlp_xgboost(
         if _mlflow_active:
             mlflow.log_artifact(enc_path, artifact_path="mlp_encoder")
             mlflow.log_artifact(xgb_path, artifact_path="mlp_xgboost")
-            import mlflow.xgboost
             mlflow.xgboost.log_model(xgb_model, artifact_path="mlp_xgb_model")
 
     return encoder, xgb_model

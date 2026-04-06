@@ -76,6 +76,7 @@ import tempfile
 from typing import Any, Dict, List, Optional, Tuple
 
 import mlflow
+import mlflow.xgboost
 import numpy as np
 import pandas as pd
 import torch
@@ -1160,8 +1161,7 @@ def train_gnn_xgboost(
 
         if _mlflow_active:
             mlflow.log_artifact(xgb_path, artifact_path="gnn_xgboost")
-            import mlflow.xgboost as _mlflow_xgb
-            _mlflow_xgb.log_model(xgb_model, artifact_path="gnn_xgb_model")
+            mlflow.xgboost.log_model(xgb_model, artifact_path="gnn_xgb_model")
 
     return gnn_model, xgb_model
 

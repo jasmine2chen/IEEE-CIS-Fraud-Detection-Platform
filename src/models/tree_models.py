@@ -1,4 +1,4 @@
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Optional
 
 import numpy as np
 from xgboost import XGBClassifier
@@ -19,18 +19,35 @@ def make_fpr_eval_metric(threshold: float = 0.85):
     The function receives raw logit scores (before sigmoid) because
     XGBClassifier uses binary:logistic internally.
     """
-    def fpr_at_threshold(predt: np.ndarray, dtrain) -> Tuple[str, float]:
-        labels = dtrain.get_label()
-        # predt is raw logit — apply sigmoid to get probabilities
-        probs = 1.0 / (1.0 + np.exp(-predt))
-        preds_binary = (probs >= threshold).astype(int)
+    def fpr_at_threshold(predt: np.ndarray, dtrain):
+        # XGBoost 2.x has two calling conventions for custom eval metrics:
+        #
+        # 1. Core DMatrix API — func(raw_logits, DMatrix) → (name, float)
+        #    The caller unpacks the tuple and formats it directly.
+        #
+        # 2. sklearn API — the wrapper (sklearn.py) calls func(y_true, y_score)
+        #    and then does: return func.__name__, func(y_true, y_score)
+        #    So the function must return just a float — the name comes from
+        #    func.__name__ ("fpr_at_threshold"). Returning a tuple here produces
+        #    a nested tuple that breaks the %f format string downstream.
+        if hasattr(dtrain, "get_label"):
+            # Core DMatrix path: predt = raw logits, dtrain = DMatrix
+            labels = dtrain.get_label()
+            probs = 1.0 / (1.0 + np.exp(-predt))
+        else:
+            # sklearn path: predt = y_true (labels), dtrain = y_score (probs)
+            labels = predt
+            probs = dtrain
 
+        preds_binary = (probs >= threshold).astype(int)
         negatives = labels == 0
         fp = int(((preds_binary == 1) & negatives).sum())
         tn = int(((preds_binary == 0) & negatives).sum())
         fpr = fp / (fp + tn + 1e-8)  # epsilon guards against all-fraud eval sets
 
-        return "fpr_at_threshold", float(fpr)
+        if hasattr(dtrain, "get_label"):
+            return "fpr_at_threshold", float(fpr)  # core API expects (name, value)
+        return float(fpr)  # sklearn API: wrapper supplies name from func.__name__
 
     return fpr_at_threshold
 
