@@ -53,7 +53,7 @@ def plot_score_distributions(
     legit_scores = y_prob[y_true == 0]
     fraud_scores = y_prob[y_true == 1]
 
-    bins = np.linspace(0, 1, 60)
+    bins: list = np.linspace(0, 1, 60).tolist()
     ax.hist(legit_scores, bins=bins, density=True, alpha=0.55,
             color="#4C9BE8", label=f"Legitimate (n={len(legit_scores):,})")
     ax.hist(fraud_scores, bins=bins, density=True, alpha=0.70,

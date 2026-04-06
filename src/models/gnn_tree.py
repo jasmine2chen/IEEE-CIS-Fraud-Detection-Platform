@@ -73,7 +73,10 @@ Dependencies
 import logging
 import os
 import tempfile
-from typing import Any, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
+
+if TYPE_CHECKING:
+    from torch_geometric.data import Data
 
 import mlflow
 import mlflow.xgboost
@@ -1360,5 +1363,6 @@ def gradient_feature_importance(
     logit = model(x_input, edge_index, edge_attr=ea)[node_idx].squeeze()
     logit.backward()
 
+    assert x_input.grad is not None, "Gradient not computed — ensure retain_graph=True if needed"
     grad = x_input.grad[node_idx].abs().cpu().detach().numpy()
     return grad / (grad.sum() + 1e-8)

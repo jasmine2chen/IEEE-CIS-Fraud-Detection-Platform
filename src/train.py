@@ -474,8 +474,8 @@ VALID_MODELS = ("xgboost", "mlp_xgboost", "gnn", "transformer_xgboost")
 def train(
     trans_path: str,
     id_path: str,
-    config_path: str = None,
-    model_type: str = None,
+    config_path: Optional[str] = None,
+    model_type: Optional[str] = None,
 ) -> None:
     """Main training loop — model_type overrides config model.type if provided."""
     cfg          = load_config(config_path)

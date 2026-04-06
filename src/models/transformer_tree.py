@@ -229,6 +229,8 @@ def _train_transformer_encoder(
 
     y_t = y_train.values if hasattr(y_train, "values") else y_train
     y_v = y_val.values   if hasattr(y_val,   "values") else y_val
+    n_train = int(X_train.shape[0])
+    n_val   = int(X_val.shape[0])
 
     train_loader = DataLoader(
         TensorDataset(torch.FloatTensor(X_train), torch.FloatTensor(y_t)),
@@ -252,7 +254,7 @@ def _train_transformer_encoder(
             loss.backward()
             optimizer.step()
             train_loss += loss.item() * bx.size(0)
-        train_loss /= len(train_loader.dataset)
+        train_loss /= n_train
 
         clf_model.eval()
         val_loss, all_probs = 0.0, []
@@ -262,7 +264,7 @@ def _train_transformer_encoder(
                 out = clf_model(bx).view(-1)
                 val_loss  += criterion(out, by).item() * bx.size(0)
                 all_probs.append(torch.sigmoid(out).cpu().numpy())
-        val_loss     /= len(val_loader.dataset)
+        val_loss     /= n_val
         all_probs_np  = np.concatenate(all_probs)
 
         preds    = (all_probs_np >= fpr_threshold).astype(int)
@@ -297,6 +299,7 @@ def _train_transformer_encoder(
             break
 
     # Restore best encoder weights (strip classification head)
+    assert early_stopping.best_model_weights is not None, "EarlyStopping never updated — no training iterations ran"
     clf_model.load_state_dict(early_stopping.best_model_weights)
     return clf_model.encoder
 

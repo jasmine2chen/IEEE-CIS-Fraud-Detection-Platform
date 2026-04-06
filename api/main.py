@@ -112,7 +112,7 @@ async def predict_single(
         is_fraud = fraud_prob >= FRAUD_THRESHOLD
 
         logger.info("Fraud probability: %.4f  is_fraud: %s", fraud_prob, is_fraud)
-        return PredictionResponse(fraud_probability=fraud_prob, is_fraud=is_fraud)
+        return PredictionResponse(transaction_id=None, fraud_probability=fraud_prob, is_fraud=is_fraud)
     except Exception as e:
         logger.error("Error during single prediction: %s", e)
         raise HTTPException(status_code=500, detail=str(e))
@@ -135,6 +135,7 @@ async def predict_batch(
 
         responses = [
             PredictionResponse(
+                transaction_id=None,
                 fraud_probability=float(prob),
                 is_fraud=float(prob) >= FRAUD_THRESHOLD,
             )

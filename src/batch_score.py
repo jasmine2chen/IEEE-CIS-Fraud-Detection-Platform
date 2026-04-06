@@ -17,6 +17,7 @@ Usage:
 import argparse
 import logging
 import os
+from typing import Optional
 from pathlib import Path
 
 import joblib
@@ -72,7 +73,7 @@ def run_batch_score(
     id_path: str,
     output_path: str,
     model_type: str = "xgboost",
-    config_path: str = None,
+    config_path: Optional[str] = None,
     include_features: bool = True,
 ) -> pd.DataFrame:
     """Score a full transaction file and write predictions to Parquet.

@@ -11,6 +11,7 @@ pydantic==2.12.5
 httpx==0.28.1
 joblib==1.5.3
 pyyaml==6.0.3
+types-PyYAML==6.0.12
 optuna==4.2.1
 pytest==8.4.2
 evidently==0.4.33
