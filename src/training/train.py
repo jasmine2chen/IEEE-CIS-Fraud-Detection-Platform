@@ -1,8 +1,8 @@
-"""Unified training entry point — supports XGBoost, MLP, GNN, and Transformer+GBDT.
+"""Unified training entry point — supports XGBoost and MLP+XGBoost.
 
 Model selection
 ---------------
-Pass --model xgboost (default), mlp_xgboost, gnn, or transformer_xgboost.
+Pass --model xgboost (default) or mlp_xgboost.
 The active model type is also logged as an MLflow tag.
 
 All models:
@@ -11,15 +11,12 @@ All models:
 - Use FPR-based early stopping at serving.fraud_threshold_prob.
 - Log params, metrics, and artifacts to MLflow.
 
-GNN-specific: also receives raw DataFrames for card1/addr1 graph construction.
-Transformer+GBDT: two-stage — encoder pre-training then XGBoost on enriched features.
+MLP+XGBoost: two-stage — encoder pre-training then XGBoost on enriched features.
 
 Usage
 -----
     make train                              # XGBoost
     make train MODEL=mlp_xgboost           # MLP→XGBoost hybrid
-    make train MODEL=gnn                   # GraphSAGE GNN
-    make train MODEL=transformer_xgboost   # TabTransformer + XGBoost
     make tune-then-train                   # tune → update YAML → retrain
 """
 
@@ -38,14 +35,12 @@ import torch
 from sklearn.metrics import roc_auc_score
 
 from src.config import load_config
-from src.data_prep.data_loader import prepare_data
+from src.preprocessing.data_loader import prepare_data
 from src.evaluation.metrics import auc_at_max_fpr, fpr_sweep, log_fpr_sweep
-from src.features.build_features import build_features, get_full_pipeline
-from src.models.gnn_tree import extract_gnn_embeddings, train_gnn_xgboost
-from src.models.mlp_tree import extract_mlp_embeddings, train_mlp_xgboost
-from src.models.transformer_tree import extract_embeddings, train_transformer_xgboost
-from src.models.tree_models import get_xgboost_model
-from src.registry import register_model, promote_to_champion, CANONICAL_XGB_ARTIFACT
+from src.feature_engineering.build_features import build_features, get_full_pipeline
+from src.training.models.mlp_tree import extract_mlp_embeddings, train_mlp_xgboost
+from src.training.models.tree_models import get_xgboost_model
+from src.deployment.registry import register_model, promote_to_champion, CANONICAL_XGB_ARTIFACT
 
 logger = logging.getLogger(__name__)
 
@@ -59,11 +54,6 @@ def time_consistency_split(
     Split layout (default: months 0-5 train, final month test):
       - Train: months [0, train_months)  — all months before the test month
       - Test:  final month in the dataset — out-of-time evaluation
-
-    Note: no buffer is applied. In a production setting a 60-day label-maturity
-    buffer (chargebacks, bank returns) would be discarded. For research/offline
-    experiments, including months 4-5 in training maximises training data and
-    ensures GNN edges bridge the train/test boundary (7-day window).
 
     Does NOT mutate the input DataFrame.
     """
@@ -90,15 +80,7 @@ def _log_fraud_metrics(
     amounts: Optional[np.ndarray] = None,
     max_fpr: float = 0.05,
 ) -> None:
-    """Run FPR sweep and log fraud-specific metrics to MLflow and logger.
-
-    Logs to MLflow:
-      - auc_at_5pct_fpr: partial AUC up to 5% FPR, normalized to [0, 1]
-      - recall_at_1pct_fpr, recall_at_2pct_fpr, recall_at_5pct_fpr
-      - dollar_recall_at_1pct_fpr, _2pct_, _5pct_  (when amounts provided)
-
-    The FPR sweep table is also emitted as a log.INFO message.
-    """
+    """Run FPR sweep and log fraud-specific metrics to MLflow and logger."""
     sweep = fpr_sweep(y_true, y_prob, amounts=amounts)
     log_fpr_sweep(sweep)
 
@@ -106,7 +88,6 @@ def _log_fraud_metrics(
     mlflow.log_metric("auc_at_5pct_fpr", partial_auc)
     logger.info("AUC@5%%FPR: %.4f", partial_auc)
 
-    # Log recall at standard operating points used by most fraud teams.
     for target_pct, key in [(1.0, "1pct"), (2.0, "2pct"), (5.0, "5pct")]:
         row = min(sweep, key=lambda r: abs(r["actual_fpr_pct"] - target_pct))
         mlflow.log_metric(f"recall_at_{key}_fpr", row["recall"])
@@ -119,13 +100,7 @@ def _log_fraud_metrics(
 # ---------------------------------------------------------------------------
 
 def _train_xgboost(cfg, X_train, y_train, X_test, y_test, amounts=None) -> None:
-    """Train XGBoost with FPR-based early stopping and log all artifacts.
-
-    If tune.py has run RFE, cfg["xgboost_selected_features"] holds the index
-    list produced by _rfe_xgboost(). Both X_train and X_test are masked to
-    that subset so the final model trains on exactly the features selected
-    during cross-validation.
-    """
+    """Train XGBoost with FPR-based early stopping and log all artifacts."""
     xgb_params        = cfg["xgboost_params"]
     training_cfg      = cfg["training"]
     fpr_threshold     = cfg["serving"]["fraud_threshold_prob"]
@@ -169,130 +144,10 @@ def _train_xgboost(cfg, X_train, y_train, X_test, y_test, amounts=None) -> None:
     _log_fraud_metrics(y_v, preds, amounts=amounts)
 
     os.makedirs("models", exist_ok=True)
+    model.set_params(eval_metric=None)  # closure can't be pickled; metric only needed during training
     joblib.dump(model, "models/xgboost_fraud_model.joblib")
     mlflow.xgboost.log_model(model, artifact_path=CANONICAL_XGB_ARTIFACT["xgboost"])
     logger.info("XGBoost model saved.")
-
-
-
-def _train_gnn(cfg, X_train_proc, y_train, X_test_proc, y_test,
-               X_train_raw, X_test_raw, amounts=None) -> None:
-    """Train GNN→XGBoost hybrid (two-stage).
-
-    If tune.py has run the hybrid pipeline, cfg carries:
-        gnn_params        → GNN encoder params (Phase A best)
-        gnn_stage2_params → XGBoost stage-2 params (Phase B best)
-        gnn_selected      → L2 RFE indices into [orig || GNN_embed] matrix
-
-    Tuned path: train GNN encoder → extract combined matrix → apply L2 selection
-                → train XGBoost with stage-2 params on selected combined features.
-    Untuned path: original integrated two-stage flow.
-    """
-    gnn_params    = cfg.get("gnn_params", {})
-    stage2_params = cfg.get("gnn_stage2_params")
-    l2_selected   = cfg.get("gnn_selected")
-    fpr_threshold = cfg["serving"]["fraud_threshold_prob"]
-    device        = "cuda" if torch.cuda.is_available() else "cpu"
-
-    mlflow.log_params({k: v for k, v in gnn_params.items()})
-    mlflow.set_tag("model_type", "gnn")
-    mlflow.log_param("fpr_threshold", fpr_threshold)
-    mlflow.log_param("device", device)
-
-    X_train_eng = build_features(X_train_raw.copy())
-    X_test_eng  = build_features(X_test_raw.copy())
-
-    logger.info(
-        "Training GNN+XGBoost on %d nodes, %d features  device=%s",
-        X_train_proc.shape[0], X_train_proc.shape[1], device,
-    )
-
-    from src.models.gnn_tree import build_transaction_graph
-    from torch_geometric.data import Data
-
-    if stage2_params and l2_selected is not None:
-        mlflow.log_params({f"stage2_{k}": v for k, v in stage2_params.items()})
-        mlflow.log_param("n_l2_selected", len(l2_selected))
-
-        # Stage 1: train GNN encoder (XGBoost produced here is discarded)
-        combined_for_enc = {**stage2_params, **gnn_params}
-        gnn_model, _ = train_gnn_xgboost(
-            X_train_proc, y_train, X_test_proc, y_test,
-            X_train_eng, X_test_eng,
-            params=combined_for_enc, fpr_threshold=fpr_threshold,
-            device=device, save_path="models/gnn_xgboost",
-        )
-
-        # Build combined graph for embedding extraction
-        X_eng_combined  = pd.concat(
-            [X_train_eng.reset_index(drop=True), X_test_eng.reset_index(drop=True)],
-            ignore_index=True,
-        )
-        X_proc_combined = np.vstack([X_train_proc, X_test_proc])
-        edge_index, edge_attr, x = build_transaction_graph(
-            X_eng_combined, X_proc_combined,
-            max_edges_per_node=gnn_params.get("max_edges_per_node", 10),
-        )
-        data = Data(x=x, edge_index=edge_index, edge_attr=edge_attr)
-        embed_train, embed_test = extract_gnn_embeddings(
-            gnn_model, data, len(X_train_proc), device=device,
-        )
-        X_comb_train = np.concatenate([X_train_proc, embed_train], axis=1)
-        X_comb_test  = np.concatenate([X_test_proc,  embed_test],  axis=1)
-
-        feat_idx    = np.array(l2_selected, dtype=int)
-        X_sel_train = X_comb_train[:, feat_idx]
-        X_sel_test  = X_comb_test[:,  feat_idx]
-
-        early_stopping = stage2_params.get("xgb_early_stopping_rounds",
-                                            cfg["training"].get("early_stopping_rounds", 50))
-        xgb_model = get_xgboost_model(
-            params=stage2_params, early_stopping_rounds=early_stopping,
-            fpr_threshold=fpr_threshold,
-        )
-        xgb_model.fit(X_sel_train, y_train,
-                      eval_set=[(X_sel_test, y_test)], verbose=False)
-
-        preds = xgb_model.predict_proba(X_sel_test)[:, 1]
-        os.makedirs("models/gnn_xgboost", exist_ok=True)
-        import joblib as _joblib
-        _joblib.dump(xgb_model, "models/gnn_xgboost/xgboost_stage2.joblib")
-        mlflow.xgboost.log_model(xgb_model, artifact_path="gnn_xgboost_stage2_model")
-
-    else:
-        # Untuned path: original integrated two-stage flow
-        gnn_model, xgb_model = train_gnn_xgboost(
-            X_train_proc, y_train, X_test_proc, y_test,
-            X_train_eng, X_test_eng,
-            params=gnn_params, fpr_threshold=fpr_threshold,
-            device=device, save_path="models/gnn_xgboost",
-        )
-        X_eng_combined  = pd.concat(
-            [X_train_eng.reset_index(drop=True), X_test_eng.reset_index(drop=True)],
-            ignore_index=True,
-        )
-        X_proc_combined = np.vstack([X_train_proc, X_test_proc])
-        edge_index, edge_attr, x = build_transaction_graph(
-            X_eng_combined, X_proc_combined,
-            max_edges_per_node=gnn_params.get("max_edges_per_node", 10),
-        )
-        data = Data(x=x, edge_index=edge_index, edge_attr=edge_attr)
-        _, test_emb = extract_gnn_embeddings(
-            gnn_model, data, len(X_train_proc), device=device,
-        )
-        X_sel_test = np.concatenate([X_test_proc, test_emb], axis=1)
-        preds      = xgb_model.predict_proba(X_sel_test)[:, 1]
-
-    y_v = y_test.values if hasattr(y_test, "values") else y_test
-    auc = roc_auc_score(y_v, preds)
-    logger.info("GNN+XGBoost OOT AUC: %.4f", auc)
-    mlflow.log_metric("OOT_AUC", auc)
-    mlflow.log_metric(
-        "best_iteration",
-        getattr(xgb_model, "best_iteration", gnn_params.get("n_estimators", 300)),
-    )
-    _log_fraud_metrics(y_v, preds, amounts=amounts)
-    mlflow.xgboost.log_model(xgb_model, artifact_path=CANONICAL_XGB_ARTIFACT["gnn"])
 
 
 def _train_mlp_xgboost(cfg, X_train, y_train, X_test, y_test, amounts=None) -> None:
@@ -315,7 +170,7 @@ def _train_mlp_xgboost(cfg, X_train, y_train, X_test, y_test, amounts=None) -> N
     stage2_params  = cfg.get("mlp_xgboost_stage2_params")
     l2_selected    = cfg.get("mlp_xgboost_selected")
     fpr_threshold  = cfg["serving"]["fraud_threshold_prob"]
-    device         = "cuda" if torch.cuda.is_available() else "cpu"
+    device         = "cuda" if torch.cuda.is_available() else ("mps" if torch.backends.mps.is_available() else "cpu")
 
     mlflow.log_params({k: v for k, v in encoder_params.items()})
     mlflow.set_tag("model_type", "mlp_xgboost")
@@ -362,6 +217,7 @@ def _train_mlp_xgboost(cfg, X_train, y_train, X_test, y_test, amounts=None) -> N
         preds = xgb_model.predict_proba(X_sel_test)[:, 1]
         os.makedirs("models/mlp_xgboost", exist_ok=True)
         import joblib as _joblib
+        xgb_model.set_params(eval_metric=None)  # closure can't be pickled
         _joblib.dump(xgb_model, "models/mlp_xgboost/xgboost_stage2.joblib")
         mlflow.xgboost.log_model(xgb_model, artifact_path="mlp_xgboost_stage2_model")
 
@@ -384,91 +240,11 @@ def _train_mlp_xgboost(cfg, X_train, y_train, X_test, y_test, amounts=None) -> N
     mlflow.xgboost.log_model(xgb_model, artifact_path=CANONICAL_XGB_ARTIFACT["mlp_xgboost"])
 
 
-def _train_transformer_xgboost(cfg, X_train, y_train, X_test, y_test, amounts=None) -> None:
-    """Train TabTransformer encoder + XGBoost hybrid.
-
-    If tune.py has run the hybrid pipeline, cfg carries:
-        transformer_params          → encoder architecture params (Phase A best)
-        transformer_stage2_params   → XGBoost stage-2 params (Phase B best)
-        transformer_xgboost_selected → L2 RFE indices into [orig || CLS_embed]
-
-    Tuned path: train encoder → extract combined matrix → apply L2 selection → train XGBoost.
-    Untuned path: original integrated two-stage flow.
-    """
-    encoder_params = cfg.get("transformer_params", {})
-    stage2_params  = cfg.get("transformer_stage2_params")
-    l2_selected    = cfg.get("transformer_xgboost_selected")
-    fpr_threshold  = cfg["serving"]["fraud_threshold_prob"]
-    device         = "cuda" if torch.cuda.is_available() else "cpu"
-
-    mlflow.log_params({k: v for k, v in encoder_params.items()})
-    mlflow.set_tag("model_type", "transformer_xgboost")
-    mlflow.log_param("fpr_threshold", fpr_threshold)
-    mlflow.log_param("device", device)
-
-    logger.info(
-        "Training Transformer+GBDT on %d samples, %d features  device=%s",
-        X_train.shape[0], X_train.shape[1], device,
-    )
-
-    if stage2_params and l2_selected is not None:
-        mlflow.log_params({f"stage2_{k}": v for k, v in stage2_params.items()})
-        mlflow.log_param("n_l2_selected", len(l2_selected))
-
-        combined_for_enc = {**stage2_params, **encoder_params}
-        encoder, _ = train_transformer_xgboost(
-            X_train, y_train, X_test, y_test,
-            params=combined_for_enc, fpr_threshold=fpr_threshold,
-            device=device, save_path="models/transformer_xgboost",
-        )
-
-        embed_train  = extract_embeddings(encoder, X_train, device=device)
-        embed_test   = extract_embeddings(encoder, X_test,  device=device)
-        X_comb_train = np.concatenate([X_train, embed_train], axis=1)
-        X_comb_test  = np.concatenate([X_test,  embed_test],  axis=1)
-
-        feat_idx     = np.array(l2_selected, dtype=int)
-        X_sel_train  = X_comb_train[:, feat_idx]
-        X_sel_test   = X_comb_test[:,  feat_idx]
-
-        early_stopping = stage2_params.get("xgb_early_stopping_rounds",
-                                            cfg["training"].get("early_stopping_rounds", 50))
-        xgb_model = get_xgboost_model(
-            params=stage2_params, early_stopping_rounds=early_stopping,
-            fpr_threshold=fpr_threshold,
-        )
-        xgb_model.fit(X_sel_train, y_train,
-                      eval_set=[(X_sel_test, y_test)], verbose=False)
-
-        preds = xgb_model.predict_proba(X_sel_test)[:, 1]
-        os.makedirs("models/transformer_xgboost", exist_ok=True)
-        import joblib as _joblib
-        _joblib.dump(xgb_model, "models/transformer_xgboost/xgboost_stage2.joblib")
-        mlflow.xgboost.log_model(xgb_model, artifact_path="transformer_xgboost_stage2_model")
-
-    else:
-        encoder, xgb_model = train_transformer_xgboost(
-            X_train, y_train, X_test, y_test,
-            params=encoder_params, fpr_threshold=fpr_threshold,
-            device=device, save_path="models/transformer_xgboost",
-        )
-        embed_test  = extract_embeddings(encoder, X_test, device=device)
-        X_sel_test  = np.concatenate([X_test, embed_test], axis=1)
-        preds       = xgb_model.predict_proba(X_sel_test)[:, 1]
-
-    y_v = y_test.values if hasattr(y_test, "values") else y_test
-    auc = roc_auc_score(y_v, preds)
-    logger.info("Transformer+GBDT OOT AUC: %.4f", auc)
-    mlflow.log_metric("OOT_AUC", auc)
-    _log_fraud_metrics(y_v, preds, amounts=amounts)
-    mlflow.xgboost.log_model(xgb_model, artifact_path=CANONICAL_XGB_ARTIFACT["transformer_xgboost"])
-
-
 # ---------------------------------------------------------------------------
 # Main entry point
 # ---------------------------------------------------------------------------
 
-VALID_MODELS = ("xgboost", "mlp_xgboost", "gnn", "transformer_xgboost")
+VALID_MODELS = ("xgboost", "mlp_xgboost")
 
 
 def train(
@@ -503,7 +279,6 @@ def train(
         X_train_proc  = full_pipeline.fit_transform(X_train_raw)
         X_test_proc   = full_pipeline.transform(X_test_raw)
 
-        # TransactionAmt enables dollar recall in the FPR sweep.
         amounts = (
             X_test_raw["TransactionAmt"].values
             if "TransactionAmt" in X_test_raw.columns else None
@@ -511,13 +286,8 @@ def train(
 
         if active_model == "xgboost":
             _train_xgboost(cfg, X_train_proc, y_train, X_test_proc, y_test, amounts=amounts)
-        elif active_model == "mlp_xgboost":
+        else:  # mlp_xgboost
             _train_mlp_xgboost(cfg, X_train_proc, y_train, X_test_proc, y_test, amounts=amounts)
-        elif active_model == "gnn":
-            _train_gnn(cfg, X_train_proc, y_train, X_test_proc, y_test,
-                       X_train_raw, X_test_raw, amounts=amounts)
-        else:  # transformer_xgboost
-            _train_transformer_xgboost(cfg, X_train_proc, y_train, X_test_proc, y_test, amounts=amounts)
 
         # Register model to MLflow Model Registry
         try:
@@ -538,10 +308,6 @@ def train(
         logger.info("Feature pipeline saved to models/ and logged to MLflow.")
 
         # Save reference dataset for drift monitoring.
-        # We use the OOT test set (X_test_raw) — it represents the held-out
-        # production-like distribution. Sampled to 50k rows to keep artifacts small.
-        # batch_score.py outputs the same raw feature columns so the drift monitor
-        # can compare distributions column-by-column.
         try:
             import tempfile
             ref_sample = X_test_raw.sample(

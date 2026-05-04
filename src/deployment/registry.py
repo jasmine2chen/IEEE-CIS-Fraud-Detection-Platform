@@ -7,8 +7,6 @@ Alias convention (MLflow 2.x — stage transitions are deprecated):
 One registered model per model_type:
     fraud_detection_xgboost
     fraud_detection_mlp_xgboost
-    fraud_detection_gnn
-    fraud_detection_transformer_xgboost
 """
 
 import logging
@@ -27,20 +25,16 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 MODEL_NAME_MAP: dict = {
-    "xgboost": "fraud_detection_xgboost",
+    "xgboost":     "fraud_detection_xgboost",
     "mlp_xgboost": "fraud_detection_mlp_xgboost",
-    "gnn": "fraud_detection_gnn",
-    "transformer_xgboost": "fraud_detection_transformer_xgboost",
 }
 
 # Canonical artifact path logged by train.py for each model type.
 # All model-specific training functions log their final XGBoost model to this
 # path so the registry can locate it unambiguously regardless of the tuning path.
 CANONICAL_XGB_ARTIFACT: dict = {
-    "xgboost": "xgboost_model",
+    "xgboost":     "xgboost_model",
     "mlp_xgboost": "mlp_xgboost_final_model",
-    "gnn": "gnn_final_model",
-    "transformer_xgboost": "transformer_xgboost_final_model",
 }
 
 
@@ -234,3 +228,24 @@ def load_champion(
     xgb_model = mlflow.xgboost.load_model(f"models:/{model_name}@champion")
 
     return pipeline, xgb_model
+
+
+def load_challenger(
+    model_type: str,
+    tracking_uri: Optional[str] = None,
+) -> Optional[Tuple[Any, Any]]:
+    """Load the @challenger version if one exists. Returns None if not set."""
+    if tracking_uri:
+        mlflow.set_tracking_uri(tracking_uri)
+
+    model_name = get_model_name(model_type)
+    client = MlflowClient()
+    try:
+        mv = client.get_model_version_by_alias(name=model_name, alias="challenger")
+        run_id = mv.run_id
+        pipeline = mlflow.sklearn.load_model(f"runs:/{run_id}/feature_pipeline")
+        xgb_model = mlflow.xgboost.load_model(f"models:/{model_name}@challenger")
+        logger.info("Loaded @challenger for '%s' — version %s", model_type, mv.version)
+        return pipeline, xgb_model
+    except MlflowException:
+        return None

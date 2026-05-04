@@ -13,16 +13,9 @@ early stopping responds to the business metric (discrete, fast-plateauing).
 
 MLP→XGBoost hybrid (train_mlp_xgboost)
 ---------------------------------------
-Two-stage training analogous to train_transformer_xgboost:
+Two-stage training:
   Stage 1 — MLPEncoder pre-trained with FocalLoss + FPR early stopping.
   Stage 2 — XGBoost trained on [original_features || MLP_embeddings].
-
-Enables direct A/B comparison:
-  XGBoost alone          → baseline
-  MLP→XGBoost            → does a shallow MLP add feature interactions?
-  Transformer→XGBoost    → does attention add more than a plain MLP?
-All three use identical X_proc input, so differences are attributable solely
-to the feature extraction architecture.
 """
 
 import copy
@@ -125,11 +118,41 @@ class EarlyStopping:
 # MLP→XGBoost hybrid
 # ---------------------------------------------------------------------------
 
+class _ResidualLayer(nn.Module):
+    """Single MLP layer with an optional residual (skip) connection.
+
+    When in_dim != out_dim a linear projection aligns dimensions for the
+    residual path (same convention as ResNet bottleneck blocks).
+    """
+
+    def __init__(self, in_dim: int, out_dim: int, dropout_rate: float):
+        super().__init__()
+        self.main = nn.Sequential(
+            nn.Linear(in_dim, out_dim),
+            nn.BatchNorm1d(out_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout_rate),
+        )
+        # Identity shortcut when dims match; linear projection otherwise.
+        self.shortcut: nn.Module = (
+            nn.Identity() if in_dim == out_dim
+            else nn.Linear(in_dim, out_dim, bias=False)
+        )
+        nn.init.kaiming_normal_(self.main[0].weight, mode="fan_in", nonlinearity="relu")
+        nn.init.constant_(self.main[0].bias, 0)
+        if isinstance(self.shortcut, nn.Linear):
+            nn.init.kaiming_normal_(self.shortcut.weight, mode="fan_in", nonlinearity="relu")
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.main(x) + self.shortcut(x)
+
+
 class MLPEncoder(nn.Module):
     """MLP feature extractor for the MLP→XGBoost hybrid.
 
     Architecture: input → [256 → 128 → 64] (default)
     Each layer: Linear → BatchNorm → ReLU → Dropout
+    Optional residual connections via use_residual=True.
 
     ReLU is used because the embedding output feeds XGBoost, not another
     neural layer — dead neurons matter less when we are not backpropagating
@@ -145,21 +168,27 @@ class MLPEncoder(nn.Module):
         input_dim: int,
         hidden_dims: Tuple[int, ...] = (256, 128, 64),
         dropout_rate: float = 0.3,
+        use_residual: bool = False,
     ):
         super().__init__()
+        self.use_residual = use_residual
         layers: List[nn.Module] = []
         in_d = input_dim
         for out_d in hidden_dims:
-            layers += [
-                nn.Linear(in_d, out_d),
-                nn.BatchNorm1d(out_d),
-                nn.ReLU(),
-                nn.Dropout(dropout_rate),
-            ]
+            if use_residual:
+                layers.append(_ResidualLayer(in_d, out_d, dropout_rate))
+            else:
+                layers += [
+                    nn.Linear(in_d, out_d),
+                    nn.BatchNorm1d(out_d),
+                    nn.ReLU(),
+                    nn.Dropout(dropout_rate),
+                ]
             in_d = out_d
         self.encoder  = nn.Sequential(*layers)
         self.embed_dim = hidden_dims[-1]
-        self._init_weights()
+        if not use_residual:
+            self._init_weights()
 
     def _init_weights(self) -> None:
         for m in self.encoder.modules():
@@ -221,20 +250,25 @@ def _train_mlp_encoder(
     fpr_threshold: float,
     device: str,
 ) -> MLPEncoder:
-    """Pre-train MLPEncoder with FocalLoss and FPR-based early stopping.
+    """Pre-train MLPEncoder with FocalLoss, ReduceLROnPlateau, gradient clipping,
+    and FPR-based early stopping.
 
     Returns the encoder (no classification head) with best-checkpoint weights.
-    Mirrors _train_transformer_encoder in transformer_tree.py.
     """
-    epochs     = params.get("encoder_epochs", 20)
-    batch_size = params.get("batch_size", 1024)
-    lr         = params.get("learning_rate", 1e-3)
-    patience   = params.get("patience", 5)
-    hidden_dims = tuple(params.get("hidden_dims", [256, 128, 64]))
+    epochs          = params.get("encoder_epochs", 20)
+    batch_size      = params.get("batch_size", 1024)
+    lr              = params.get("learning_rate", 1e-3)
+    patience        = params.get("patience", 5)
+    hidden_dims     = tuple(params.get("hidden_dims", [256, 128, 64]))
+    use_residual    = params.get("use_residual", False)
+    clip_grad_norm  = params.get("clip_grad_norm", 1.0)
 
     input_dim = X_train.shape[1]
-    encoder   = MLPEncoder(input_dim, hidden_dims=hidden_dims,
-                           dropout_rate=params.get("dropout_rate", 0.3))
+    encoder   = MLPEncoder(
+        input_dim, hidden_dims=hidden_dims,
+        dropout_rate=params.get("dropout_rate", 0.3),
+        use_residual=use_residual,
+    )
     clf_model = _MLPEncoderClassifier(encoder).to(device)
 
     criterion = FocalLoss()
@@ -268,6 +302,8 @@ def _train_mlp_encoder(
             optimizer.zero_grad()
             loss = criterion(clf_model(bx).view(-1), by)
             loss.backward()
+            # Gradient clipping prevents exploding gradients in deep residual networks.
+            torch.nn.utils.clip_grad_norm_(clf_model.parameters(), max_norm=clip_grad_norm)
             optimizer.step()
             train_loss += loss.item() * bx.size(0)
         train_loss /= n_train
@@ -304,6 +340,7 @@ def _train_mlp_encoder(
                 step=epoch,
             )
 
+        # LR scheduler uses val_loss (smooth signal); early stopping uses FPR (business metric).
         scheduler.step(val_loss)
         early_stopping(val_fpr, clf_model)
         if early_stopping.early_stop:
@@ -334,18 +371,11 @@ def train_mlp_xgboost(
     Stage 2: Extract embeddings. Train XGBoost on
              [original_features || MLP_embeddings] with FPR eval metric.
 
-    Designed for direct A/B comparison with train_transformer_xgboost:
-        XGBoost alone       → no neural feature extraction
-        MLP→XGBoost         → shallow feature extraction (this function)
-        Transformer→XGBoost → attention-based feature extraction
-    All three use identical X_proc input; any AUC/FPR difference is
-    attributable solely to the feature extraction architecture.
-
     Args:
         X_train, y_train: Pre-processed training arrays.
         X_test,  y_test:  Pre-processed OOT test arrays.
         params:   hidden_dims, dropout_rate, learning_rate, encoder_epochs,
-                  batch_size, patience (encoder);
+                  batch_size, patience, use_residual, clip_grad_norm (encoder);
                   xgb_* keys forwarded to XGBClassifier,
                   xgb_early_stopping_rounds.
         fpr_threshold: Operating threshold (both stages).
@@ -355,14 +385,15 @@ def train_mlp_xgboost(
     Returns:
         (encoder, xgb_model): MLPEncoder + fitted XGBClassifier.
     """
-    from src.models.tree_models import get_xgboost_model
+    from src.training.models.tree_models import get_xgboost_model
 
     if params is None:
         params = {}
 
     # ---- Stage 1: encoder pre-training ----
-    logger.info("Stage 1: Pre-training MLPEncoder (%d features, hidden_dims=%s).",
-                X_train.shape[1], params.get("hidden_dims", [256, 128, 64]))
+    logger.info("Stage 1: Pre-training MLPEncoder (%d features, hidden_dims=%s, use_residual=%s).",
+                X_train.shape[1], params.get("hidden_dims", [256, 128, 64]),
+                params.get("use_residual", False))
     encoder = _train_mlp_encoder(
         X_train, y_train, X_test, y_test,
         params=params, fpr_threshold=fpr_threshold, device=device,
@@ -429,6 +460,7 @@ def train_mlp_xgboost(
             enc_path,
         )
         import joblib
+        xgb_model.set_params(eval_metric=None)  # closure can't be pickled
         joblib.dump(xgb_model, xgb_path)
         logger.info("Saved MLP encoder → %s, XGBoost → %s", enc_path, xgb_path)
 

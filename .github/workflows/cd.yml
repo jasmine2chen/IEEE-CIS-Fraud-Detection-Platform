@@ -36,7 +36,7 @@ jobs:
 
       - name: Registry import check
         run: |
-          python -c "from src.registry import MODEL_NAME_MAP; print('registry ok')"
+          python -c "from src.deployment.registry import MODEL_NAME_MAP; print('registry ok')"
 
   build-and-push:
     name: Build & Push Docker Image

@@ -1,0 +1,36 @@
+[
+  {
+    "model_name": "xgboost",
+    "roc_auc": 0.8306618797984445,
+    "pr_auc": 0.4228791051191805,
+    "auc_at_5pct_fpr": 0.4247593281684346,
+    "recall_at_1pct_fpr": 0.3097,
+    "recall_at_2pct_fpr": 0.4218,
+    "recall_at_5pct_fpr": 0.5192,
+    "dollar_recall_at_2pct_fpr": 0.3602,
+    "brier_score": 0.046712369640185936,
+    "inference_latency_p50_ms": 15.443478999999982,
+    "inference_latency_p99_ms": 16.015010749998943,
+    "n_estimators": 0,
+    "run_id": "disk",
+    "model_version": "unknown",
+    "artifact_source": "disk"
+  },
+  {
+    "model_name": "mlp_xgboost",
+    "roc_auc": 0.8956846451295553,
+    "pr_auc": 0.5118406560469453,
+    "auc_at_5pct_fpr": 0.5172095295596705,
+    "recall_at_1pct_fpr": 0.4277,
+    "recall_at_2pct_fpr": 0.5162,
+    "recall_at_5pct_fpr": 0.6342,
+    "dollar_recall_at_2pct_fpr": 0.4251,
+    "brier_score": 0.048622952138400774,
+    "inference_latency_p50_ms": 15.5929164999975,
+    "inference_latency_p99_ms": 16.937249500003364,
+    "n_estimators": 0,
+    "run_id": "disk",
+    "model_version": "unknown",
+    "artifact_source": "disk"
+  }
+]

@@ -7,7 +7,7 @@ Predictions include: TransactionID, fraud_probability, is_fraud,
 score_timestamp, model_version, model_type.
 
 Usage:
-    python -m src.batch_score \\
+    python -m src.deployment.batch_score \\
         --trans  data/raw/test_transaction.csv \\
         --id     data/raw/test_identity.csv \\
         --output data/predictions/batch_YYYYMMDD.parquet \\
@@ -24,9 +24,9 @@ import joblib
 import mlflow
 import pandas as pd
 
-from src import registry
+from src.deployment import registry
 from src.config import load_config
-from src.data_prep.data_loader import prepare_data
+from src.preprocessing.data_loader import prepare_data
 
 logger = logging.getLogger(__name__)
 
@@ -136,7 +136,6 @@ def run_batch_score(
     )
 
     # Optionally append raw input features for downstream drift monitoring.
-    # Columns that already exist in predictions (e.g. TransactionID) are skipped.
     if include_features:
         for col in X.columns:
             if col not in predictions.columns:

@@ -109,9 +109,7 @@ src/tune.py ───────────────────  Optuna HP
     ▼
 src/train.py ──────────────────  OOT split | MLflow tracking
     ├── XGBoost                  Baseline — 9-param HPO, FPR early stopping
-    ├── MLP → XGBoost            FocalLoss encoder → [orig‖embed] → GBDT
-    ├── GraphSAGE → XGBoost      7-day temporal graph → node embeddings → GBDT
-    └── TabTransformer → XGBoost Pre-LN CLS-token attention → [orig‖embed] → GBDT
+    └── MLP → XGBoost            FocalLoss encoder → [orig‖embed] → GBDT
     │
     ▼
 api/main.py                     FastAPI — /predict  /predict_batch  /health
@@ -126,22 +124,18 @@ See [docs/architecture.md](docs/architecture.md) for full system diagrams.
 
 ## Model Architecture
 
-Four architectures on the same feature set and evaluation harness for controlled comparison.
+Two architectures on the same feature set and evaluation harness for controlled comparison.
 
 | Model | Architecture | Key Design Decisions |
 |---|---|---|
 | `xgboost` | Gradient-boosted trees | 9-param Bayesian HPO; FPR early stopping; L1 RFE on original features |
 | `mlp_xgboost` | MLP encoder → XGBoost | FocalLoss pre-training; embeddings concat to original features; L2 RFE on `[orig‖embed]` |
-| `gnn` | GraphSAGE → XGBoost | Directed 7-day temporal graph per entity column; time-window prevents concept drift leakage |
-| `transformer_xgboost` | TabTransformer → XGBoost | Per-feature linear tokenizer; Pre-LN stability; CLS token captures global feature interactions; SHAP-compatible XGBoost head for SR 11-7 model risk governance |
 
-Neural encoders capture high-order feature interactions that axis-aligned tree splits miss. The XGBoost classifier handles missing values natively, provides fast inference, and keeps the model fully SHAP-explainable — a regulatory requirement in banking.
+The MLP encoder captures high-order feature interactions that axis-aligned tree splits miss. The XGBoost classifier handles missing values natively, provides fast inference, and keeps the model fully SHAP-explainable — a regulatory requirement in banking.
 
 ```bash
 make train MODEL=xgboost
 make train MODEL=mlp_xgboost
-make train MODEL=gnn
-make train MODEL=transformer_xgboost
 ```
 
 ---
@@ -152,7 +146,7 @@ The pipeline is fitted **once** before any HPO trials and serialised to `models/
 
 | Feature | Description |
 |---|---|
-| `uid` | Magic UID composite key (`card1_addr1_P_emaildomain`) linking transactions to the same cardholder; enables velocity aggregations and GNN edge construction |
+| `uid` | Magic UID composite key (`card1_addr1_P_emaildomain`) linking transactions to the same cardholder; enables velocity aggregations |
 | D-column normalisation | Removes calendar drift from `D1`–`D15` delta-day columns |
 | `uid` velocity aggregations | Transaction count and amount statistics per uid over rolling windows |
 | `FrequencyEncoder` | Leakage-free categorical encoding; fitted on train split only |
@@ -172,7 +166,7 @@ HPO and feature selection are designed around production constraints: high train
 | 3. Re-tune HPO | Bayesian HPO on selected features only | Optimal regularisation and tree depth shift as feature count drops; prevents underfitting |
 | 4. Stability gate | `var(fold FPRs) < 0.03` | Flags models with high temporal variance before promotion; logged to MLflow |
 
-### Neural Hybrid Models — Two-Phase Pipeline
+### MLP+XGBoost — Two-Phase Pipeline
 
 Multi-fold CV on neural encoder training is cost-prohibitive at production scale. The pipeline decouples encoder cost from XGBoost cost:
 
@@ -190,6 +184,8 @@ xgboost_selected_features: [0, 3, 7, ...]
 mlp_xgboost_stage2_params: {n_estimators: 420, ...}
 mlp_xgboost_selected: [0, 2, 5, 67, 68, ...]
 ```
+
+
 
 ---
 
@@ -319,8 +315,8 @@ Drift resistance is built into the training and tuning framework rather than add
 ### Retraining Pipeline
 
 ```bash
-make tune-then-train MODEL=xgboost   # tune → write config → retrain
-make tune-then-train MODEL=gnn
+make tune-then-train MODEL=xgboost      # tune → write config → retrain
+make tune-then-train MODEL=mlp_xgboost
 ```
 
 `tune-then-train` is designed to run as a scheduled job. Config writeback is the handoff between tuning and training — no code changes required to deploy a retrained model.

@@ -140,10 +140,10 @@ def get_full_pipeline() -> Pipeline:
                                 frequency encoding + scaling (categorical)
 
     Both numeric and categorical paths exit as ~N(0,1) so that all columns
-    arrive at the same scale when passed to gradient-based models (MLP,
-    TabTransformer, GNN). Without scaling the categorical path, raw frequency
-    counts (e.g. 47823) would dwarf normalised numerics (~[-3, 3]), causing
-    the FeatureTokenizer gradients to be dominated by high-frequency categories.
+    arrive at the same scale when passed to gradient-based models (MLP encoder).
+    Without scaling the categorical path, raw frequency counts (e.g. 47823)
+    would dwarf normalised numerics (~[-3, 3]), causing encoder gradients to be
+    dominated by high-frequency categories.
     XGBoost is unaffected (splits are scale-invariant) so this change is a
     no-op for tree-only training.
 
@@ -221,10 +221,6 @@ def add_uid_aggregations(df: pd.DataFrame) -> pd.DataFrame:
     Serving alignment: the expanding window mirrors a production lookup store
     (e.g. Redis) pre-populated from training history. New uids at serve time
     return NaN → training-median fallback, exactly matching this behaviour.
-
-    GNN note: this function is also called for graph construction (to get uid
-    and TransactionDT for edges). The extra features computed here are unused
-    by the GNN — only uid/TransactionDT are extracted from X_eng DataFrames.
     """
     if "uid" not in df.columns or "TransactionDT" not in df.columns:
         return df

@@ -23,7 +23,7 @@ from typing import Optional
 import mlflow
 import pandas as pd
 
-from src import registry
+from src.deployment import registry
 from src.config import load_config
 
 logger = logging.getLogger(__name__)

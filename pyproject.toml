@@ -32,7 +32,7 @@ dev = [
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["src*", "api*"]
+include = ["src*"]
 
 [tool.mypy]
 python_version = "3.9"

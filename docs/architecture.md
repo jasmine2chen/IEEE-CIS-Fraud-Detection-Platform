@@ -32,17 +32,11 @@ flowchart TD
         K --> M1[XGBoost\nFPR early stopping]
         K --> M2[MLP Encoder\nFocalLoss → embeddings]
         M2 --> M2b[XGBoost on\nenriched features]
-        K --> M3[GraphSAGE\ndirected 7-day graph]
-        M3 --> M3b[XGBoost on\nnode embeddings]
-        K --> M4[TabTransformer\nCLS-token attention]
-        M4 --> M4b[XGBoost on\nCLS embeddings]
     end
 
     subgraph Evaluation
         M1  --> E1[FPR sweep\n0.1%→25% FPR]
         M2b --> E1
-        M3b --> E1
-        M4b --> E1
         L   --> E1
         E1  --> E2[partial AUC @5% FPR\ndollar recall\nMLflow logging]
     end
@@ -85,46 +79,6 @@ flowchart LR
     XGB2 --> OUT[fraud_probability]
 
     note1[FocalLoss α=0.25 γ=2.0\naddresses class imbalance]
-```
-
-### 2c. GraphSAGE → XGBoost Hybrid
-
-```mermaid
-flowchart TD
-    subgraph Graph Construction
-        TX[Transactions] --> ED[Directed edges\npast→future within 7-day window]
-        ED --> EF[6-D edge features\ntemporal_decay, uid_flag, card1_flag,\nDeviceInfo_flag, email_flag, addr1_flag]
-        EF --> EG[EdgeGate: learned\naggregation weights]
-    end
-
-    subgraph GNN Encoder
-        EG --> GS1[GraphSAGE Layer 1\nhidden=128]
-        GS1 --> GS2[GraphSAGE Layer 2\nhidden=128]
-    end
-
-    subgraph Hybrid Output
-        GS2 --> NODE[Node Embeddings]
-        TX  --> CAT2[Concat: tabular + node emb]
-        NODE --> CAT2
-        CAT2 --> XGB3[XGBoost]
-        XGB3 --> OUT2[fraud_probability]
-    end
-
-    note2[K-NN cosine-similarity fallback\nfor isolated nodes]
-```
-
-### 2d. TabTransformer → XGBoost Hybrid
-
-```mermaid
-flowchart LR
-    FP2[Feature Pipeline] --> TOK[Token Embeddings\nd_token=64 per feature]
-    TOK --> CLS[Prepend CLS token]
-    CLS --> ATT1[Multi-Head Attention\nnhead=4, 2 layers]
-    ATT1 --> CLS2[Extract CLS token\n64-dim summary]
-    FP2  --> CAT3[Concat: original + CLS]
-    CLS2 --> CAT3
-    CAT3 --> XGB4[XGBoost\non enriched features]
-    XGB4 --> OUT3[fraud_probability]
 ```
 
 ---
@@ -174,16 +128,16 @@ sequenceDiagram
     participant YAML as model_config.yaml
     participant MLF as MLflow
 
-    Dev->>Opt: make tune MODEL=gnn TRIALS=100
+    Dev->>Opt: make tune MODEL=mlp_xgboost TRIALS=100
     loop 100 trials
-        Opt->>Train: suggest params (hidden_dim, lr, depth, ...)
+        Opt->>Train: suggest params (hidden_dims, lr, depth, ...)
         Train->>Train: OOT split + feature engineering
         Train->>Train: train encoder → extract embeddings → train XGBoost
         Train->>MLF: log trial params + FPR metric
         Train-->>Opt: return FPR@threshold (objective to minimise)
     end
     Opt->>YAML: write best params to configs/model_config.yaml
-    Dev->>Train: make train MODEL=gnn
+    Dev->>Train: make train MODEL=mlp_xgboost
     Train->>YAML: read best params
     Train->>MLF: log final run
 ```
@@ -196,7 +150,7 @@ sequenceDiagram
 flowchart LR
     PR[Pull Request\nor push to main] --> GHA[GitHub Actions]
     GHA --> T1[Test matrix\nPython 3.9 + 3.11\npytest tests/ -v]
-    GHA --> T2[Type check\nmypy src/ api/]
+    GHA --> T2[Type check\nmypy src/]
     T1 -->|pass| MERGE[Merge allowed]
     T2 -->|pass| MERGE
     MERGE --> DOCK[docker build\nfraud_detection_api:latest]

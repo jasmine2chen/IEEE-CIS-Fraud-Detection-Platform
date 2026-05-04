@@ -41,13 +41,16 @@ ruff, isort, and mypy before the commit is accepted.
 ```
 src/
   config.py               YAML config loader
-  train.py                Training orchestrator — one entry point for all models
-  tune.py                 Optuna HPO — writes best params back to YAML
-  data_prep/              Data loading and memory optimisation
-  features/               Feature engineering (Magic UID, D-cols, uid aggs)
-  models/                 One file per model family
-  evaluation/             Metrics (FPR sweep, partial AUC) and plots
-api/                      FastAPI serving layer
+  preprocessing/          Data loading and memory optimisation
+  feature_engineering/    Magic UID, D-column normalisation, uid aggregations
+  training/               Training orchestrator (train.py), Optuna HPO (tune.py)
+    models/               One file per model family (tree_models, mlp_tree)
+  evaluation/             Metrics, ablation, benchmark, calibration
+  deployment/             Model registry, batch scoring
+    api/                  FastAPI serving layer (main.py, schemas.py)
+  monitoring/             Drift detection with Evidently
+  research_tools/         Feature inspection and experiment utilities
+pipelines/                Prefect orchestration flow
 tests/                    pytest suite — mirrors src/ layout
 configs/                  Single YAML for all training hyperparameters
 docs/                     Architecture diagrams and production guide
@@ -118,9 +121,10 @@ Test layout mirrors `src/`:
 
 | Test file | Covers |
 |---|---|
-| `tests/test_data_prep.py` | `src/data_prep/`, `src/features/` |
-| `tests/test_models.py` | `src/models/` |
-| `tests/test_api.py` | `api/` |
+| `tests/test_preprocessing.py` | `src/preprocessing/`, `src/feature_engineering/` |
+| `tests/test_models.py` | `src/training/models/` |
+| `tests/test_api.py` | `src/deployment/api/` |
+| `tests/test_research_tools.py` | `src/research_tools/` |
 
 **Rules:**
 - Use `conftest.py` fixtures for shared sample data — avoid duplicating fixture
@@ -151,8 +155,8 @@ chore/<description>         tooling, CI, dependencies
 Follow [Conventional Commits](https://www.conventionalcommits.org/):
 
 ```
-feat: add transformer_xgboost hybrid model
-fix: prevent temporal leakage in GNN edge construction
+feat: add mlp_xgboost hybrid model
+fix: resolve FPR eval metric closure pickling
 docs: add production cost analysis
 chore: bump xgboost to 2.1.4
 ```
@@ -172,17 +176,19 @@ Before opening a pull request, confirm:
 
 ## Adding a New Model
 
-1. Create `src/models/<model_name>.py` following the two-stage pattern in
-   `mlp_tree.py` or `transformer_tree.py`:
+1. Create `src/training/models/<model_name>.py` following the two-stage pattern in
+   `mlp_tree.py`:
    - Encoder pre-training function
    - Embedding extraction function
    - `train_<model>_xgboost()` entry point that returns `(encoder, xgb_model)`
 
-2. Register the model in `src/train.py` under the `elif model_type == ...` block.
+2. Register the model in `src/training/train.py` under the `elif model_type == ...` block.
 
-3. Add search spaces in `src/tune.py` under the `_suggest_<model>_params()`
+3. Add search spaces in `src/training/tune.py` under the `_suggest_<model>_params()`
    section.
 
-4. Add a smoke test in `tests/test_models.py`.
+4. Add the model name to `MODEL_NAME_MAP` in `src/deployment/registry.py`.
 
-5. Document the architecture in [docs/architecture.md](docs/architecture.md).
+5. Add a smoke test in `tests/test_models.py`.
+
+6. Document the architecture in [docs/architecture.md](docs/architecture.md).

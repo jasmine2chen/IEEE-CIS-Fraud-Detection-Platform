@@ -49,4 +49,4 @@ jobs:
           pip install mypy
 
       - name: Run mypy
-        run: mypy src/ api/ --ignore-missing-imports
+        run: mypy src/ --ignore-missing-imports

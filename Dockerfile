@@ -25,7 +25,6 @@ COPY --from=builder /usr/local/bin /usr/local/bin
 
 # Copy application source
 COPY src/ ./src/
-COPY api/ ./api/
 COPY configs/ ./configs/
 
 # Model artifacts are NOT baked into the image — mount them at runtime:
@@ -40,4 +39,4 @@ EXPOSE 8000
 ENV WORKERS=4
 
 # Use $WORKERS for horizontal concurrency; override at runtime with -e WORKERS=N
-CMD uvicorn api.main:app --host 0.0.0.0 --port 8000 --workers $WORKERS
+CMD uvicorn src.deployment.api.main:app --host 0.0.0.0 --port 8000 --workers $WORKERS

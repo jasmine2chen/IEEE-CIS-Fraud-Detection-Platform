@@ -2,7 +2,7 @@ import pytest
 import pandas as pd
 import numpy as np
 from fastapi.testclient import TestClient
-from api.main import app, get_prediction_artifacts
+from src.deployment.api.main import app, get_prediction_artifacts
 
 class MockPipeline:
     """Mimics a fitted sklearn Pipeline: accepts a raw DataFrame, returns a feature array."""
@@ -20,6 +20,8 @@ def override_get_prediction_artifacts():
     return {
         "model": MockModel(),
         "pipeline": MockPipeline(),
+        "model_version": "test-v1",
+        "source": "mock",
     }
 
 app.dependency_overrides[get_prediction_artifacts] = override_get_prediction_artifacts
@@ -85,6 +87,32 @@ def test_predict_batch_endpoint():
     for pred in data["predictions"]:
         assert 0.0 <= pred["fraud_probability"] <= 1.0
         assert isinstance(pred["is_fraud"], bool)
+
+def test_transaction_id_echoed():
+    """transaction_id supplied in the request must be echoed in the response."""
+    payload = {
+        "transaction_id": "txn-abc-123",
+        "TransactionAmt": 75.0,
+        "card1": 13926,
+        "TransactionDT": 86450,
+    }
+    response = client.post("/predict", json=payload)
+    assert response.status_code == 200
+    data = response.json()
+    assert data["transaction_id"] == "txn-abc-123"
+    assert data["model_version"] == "test-v1"
+
+
+def test_auth_rejected_when_api_key_set(monkeypatch):
+    """Requests without a valid X-API-Key must be rejected when API_KEY is configured."""
+    import src.deployment.api.main as api_module
+    monkeypatch.setattr(api_module, "_API_KEY", "secret-key")
+
+    response = client.post("/predict", json={
+        "TransactionAmt": 50.0, "card1": 1, "TransactionDT": 1,
+    })
+    assert response.status_code == 401
+
 
 def test_validation_error():
     """Test that the schema strictly rejects invalid types/missing fields."""

@@ -1,10 +1,14 @@
 .PHONY: install test lint tune train tune-then-train register promote \
         batch-score monitor run-api docker-build docker-run \
-        pipeline-run stack-up stack-down
+        pipeline-run stack-up stack-down \
+        benchmark ablation
 
 MODEL   ?= xgboost
 TRIALS  ?= 50
 OUTPUT  ?= data/predictions/batch_$(shell date +%Y%m%d).parquet
+MODELS  ?= xgboost mlp_xgboost
+BENCH_OUT ?= reports/benchmark
+ABL_OUT   ?= reports/ablation
 
 install:
 	python -m pip install -U pip
@@ -18,14 +22,14 @@ lint:
 	pre-commit run --all-files
 
 tune:
-	python -m src.tune \
+	python -m src.training.tune \
 		--trans  data/raw/train_transaction.csv \
 		--id     data/raw/train_identity.csv \
 		--model  $(MODEL) \
 		--trials $(TRIALS)
 
 train:
-	python -m src.train \
+	python -m src.training.train \
 		--trans data/raw/train_transaction.csv \
 		--id    data/raw/train_identity.csv \
 		--model $(MODEL)
@@ -38,7 +42,7 @@ register:
 promote:
 	python -c "\
 from src.config import load_config; \
-from src import registry; \
+from src.deployment import registry; \
 cfg = load_config(); \
 uri = cfg['training']['mlflow_tracking_uri']; \
 client = __import__('mlflow').MlflowClient(tracking_uri=uri); \
@@ -49,7 +53,7 @@ registry.promote_to_champion('$(MODEL)', latest.version, tracking_uri=uri); \
 print(f'Promoted $(MODEL) version {latest.version} to @champion')"
 
 batch-score:
-	python -m src.batch_score \
+	python -m src.deployment.batch_score \
 		--trans  data/raw/test_transaction.csv \
 		--id     data/raw/test_identity.csv \
 		--output $(OUTPUT) \
@@ -60,13 +64,26 @@ monitor:
 		--current $(OUTPUT) \
 		--model   $(MODEL)
 
+benchmark:
+	python -m src.evaluation.benchmark \
+		--trans  data/raw/train_transaction.csv \
+		--id     data/raw/train_identity.csv \
+		--models $(MODELS) \
+		--output $(BENCH_OUT)
+
+ablation:
+	python -m src.evaluation.ablation \
+		--trans  data/raw/train_transaction.csv \
+		--id     data/raw/train_identity.csv \
+		--output $(ABL_OUT)
+
 pipeline-run:
 	python pipelines/training_pipeline.py \
 		--model  $(MODEL) \
 		--trials $(TRIALS)
 
 run-api:
-	uvicorn api.main:app --reload --host 0.0.0.0 --port 8000
+	uvicorn src.deployment.api.main:app --reload --host 0.0.0.0 --port 8000
 
 docker-build:
 	docker build -t fraud_detection_api:latest .

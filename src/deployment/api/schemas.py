@@ -15,6 +15,9 @@ class TransactionRequest(BaseModel):
     SimpleImputer handles any that are missing.
     """
 
+    # Caller-supplied correlation ID — echoed back in the response for audit.
+    transaction_id: Optional[str] = Field(None, description="Caller-supplied ID for audit/correlation")
+
     # Core required fields
     TransactionAmt: float = Field(..., description="Transaction amount in USD")
     TransactionDT: int = Field(..., description="Seconds elapsed from dataset reference point")
@@ -59,12 +62,25 @@ class BatchTransactionRequest(BaseModel):
 
 class PredictionResponse(BaseModel):
     """Prediction result for a single transaction."""
-    transaction_id: Optional[str] = Field(None, description="Optional caller-supplied ID for tracking")
+    transaction_id: Optional[str] = Field(None, description="Echoed caller-supplied ID for audit/correlation")
     fraud_probability: float = Field(..., description="Probability [0.0, 1.0] of fraud")
     is_fraud: bool = Field(..., description="True if fraud_probability exceeds the operating threshold")
-    model_version: str = Field(default="v1.0", description="Model version that produced this prediction")
+    model_version: str = Field(..., description="Registry version of the model that produced this prediction")
 
 
 class BatchPredictionResponse(BaseModel):
     """Batch prediction response."""
     predictions: List[PredictionResponse]
+
+
+class ShadowPredictionResponse(BaseModel):
+    """Shadow mode response — champion prediction + challenger diff for offline analysis."""
+    champion: PredictionResponse
+    challenger_fraud_probability: Optional[float] = Field(
+        None,
+        description="Challenger model probability (None if no challenger loaded)",
+    )
+    champion_challenger_delta: Optional[float] = Field(
+        None,
+        description="champion_prob - challenger_prob (None if no challenger)",
+    )

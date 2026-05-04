@@ -19,10 +19,10 @@ from typing import Optional
 import mlflow
 from prefect import flow, task, get_run_logger
 
-from src import registry
+from src.deployment import registry
 from src.config import load_config
-from src.train import train
-from src.tune import run_tuning
+from src.training.train import train
+from src.training.tune import run_tuning
 
 logger = logging.getLogger(__name__)
 
@@ -181,7 +181,7 @@ def training_pipeline(
     config_path:
         Path to YAML config (uses default if None).
     model_type:
-        Model type to train (xgboost, mlp_xgboost, gnn, transformer_xgboost).
+        Model type to train (xgboost, mlp_xgboost).
     n_trials:
         Number of Optuna trials for the tuning step.
     auto_promote:
