@@ -17,18 +17,6 @@ A **production-grade ML platform** for credit card fraud detection covering the 
 - [ML Lifecycle](#ml-lifecycle)
 - [Architecture](#architecture)
 - [Model Architecture](#model-architecture)
-- [Feature Pipeline](#feature-pipeline)
-- [Tuning Framework](#tuning-framework)
-- [Evaluation Framework](#evaluation-framework)
-- [Serving & Deployment](#serving--deployment)
-- [MLOps](#mlops)
-  - [Model Registry (MLflow)](#model-registry-mlflow)
-  - [Orchestration (Prefect)](#orchestration-prefect)
-  - [Batch Scoring (Offline)](#batch-scoring-offline)
-  - [Drift Monitoring (Evidently + Grafana)](#drift-monitoring-evidently--grafana)
-  - [CI/CD](#cicd)
-- [Development](#development)
-- [Repository Layout](#repository-layout)
 
 ---
 
