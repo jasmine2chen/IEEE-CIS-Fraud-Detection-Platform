@@ -59,52 +59,6 @@ Four architectures trained on the same feature set and evaluated on an identical
 | `transformer_xgboost` | FT-Transformer → XGBoost | Per-feature linear projection → learnable positional encodings → TransformerEncoder (pre-LN); mean pool | XGBoost on `[orig ‖ transformer_embed]`; L2 RFE |
 | `gnn_xgboost` | GraphSAGE → XGBoost | 2-layer SAGE with historical neighbour aggregation by `card1` identity; FocalLoss | XGBoost on `[orig ‖ gnn_embed]`; L2 RFE |
 
-### FT-Transformer (TabTransformer)
-
-Each scalar feature is independently projected into a shared `d_model`-dimensional space via `Linear(1, d_model)`. Learnable positional encodings are added per feature index. A stack of `TransformerEncoder` layers with pre-layer-norm (`norm_first=True`) and multi-head attention learns cross-feature interactions. The output token sequence is mean-pooled to a fixed-size embedding.
-
-### GraphSAGE (Inductive GNN)
-
-Transactions are linked by shared `card1` identity. A 2-layer SAGE network aggregates neighbour features via concatenation + linear transform + BN + ReLU. To avoid building an N×N adjacency matrix, training uses a *historical aggregation* pattern: `neigh_h0` (mean raw features per card) is static; `neigh_h1` (mean first-layer outputs per card) is refreshed after each epoch from the current encoder state.
-
-Inference is fully inductive: `card_h0_mean.pkl` and `card_h1_mean.pkl` lookup tables are saved at training time so the API approximates SAGE aggregation without graph access. Unseen cards fall back to zero vectors.
-
-```bash
-make train MODEL=transformer_xgboost
-make train MODEL=gnn_xgboost
-```
-
----
-
-## HPO & Automated Retraining
-
-### Bayesian HPO Pipeline (Optuna TPE)
-
-Each model type runs a structured multi-phase tuning pipeline in `src/training/tune.py`:
-
-**XGBoost (4-step):**
-1. Optuna TPE over 9 hyperparameters with recency-weighted temporal CV
-2. Stability-gated L1 RFE — eliminates features only when `mean_FPR + k·std_FPR` improves (UCB gating prevents unstable feature removal)
-3. Re-tune on selected feature set
-4. Stability gate: `var(fold FPRs) < 0.03` must pass before writing params to config
-
-**Neural hybrids (2-phase):**
-- **Phase A** — Encoder HPO: Optuna over architecture + learning rate hyperparameters, evaluated on a single OOT split (CV is too expensive with GPU training)
-- **Phase B** — XGBoost HPO: freeze best encoder, extract `[orig ‖ embed]` matrix, run stability-gated RFE + re-tune on embeddings
-
-### S3 Config Writeback
-
-After each tuning run, `tune.py` writes the updated `model_config.yaml` back to S3 (set `S3_CONFIG_BUCKET` env var to enable). Scheduled ECS retraining tasks pull the latest config at startup, enabling zero-code drift response without a code deploy.
-
-```bash
-export S3_CONFIG_BUCKET=my-fraud-model-configs
-make tune MODEL=xgboost TRIALS=50   # → uploads configs/model_config.yaml to S3
-```
-
-### Recency-Weighted CV
-
-Expanding-window temporal folds are weighted `[1, 2, 3]` (most recent fold counts 3×). This reflects that recent fraud patterns should dominate the HPO objective over older transactions.
-
 ---
 
 ## MLOps Stack
@@ -135,17 +89,6 @@ push to main
 
 Required GitHub secrets: `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_REGION`, `ECR_REPOSITORY`, `ECS_CLUSTER`, `ECS_SERVICE`, `ECS_TASK_DEFINITION`, `CONTAINER_NAME`, `MLFLOW_TRACKING_URI`, `S3_CONFIG_BUCKET`, `SLACK_WEBHOOK_URL` (optional).
 
-### Champion / Challenger Registry
-
-```python
-from src.deployment.registry import promote_to_champion, load_champion
-
-# After training a new version
-promote_to_champion("transformer_xgboost", version="3")
-
-# API loads @champion at startup; @challenger runs in shadow mode
-pipeline, model = load_champion("transformer_xgboost")
-```
 
 ---
 
