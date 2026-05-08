@@ -1,16 +1,18 @@
-"""Model benchmarking harness — compare champion models on an identical test set.
+"""Model benchmarking harness — compare all champion models on an identical test set.
 
 Loads the @champion artifact for each requested model type from the MLflow Model
 Registry, evaluates on the same out-of-time split used during training, and
 produces a side-by-side comparison table covering discrimination, business-aligned
 operating point performance, calibration, and inference cost.
 
+Supported model types: xgboost, mlp_xgboost, transformer_xgboost, gnn_xgboost
+
 Usage
 -----
     python -m src.evaluation.benchmark \\
         --trans  data/raw/train_transaction.csv \\
         --id     data/raw/train_identity.csv \\
-        --models xgboost mlp_xgboost \\
+        --models xgboost mlp_xgboost transformer_xgboost gnn_xgboost \\
         --output reports/benchmark
 
     make benchmark
@@ -20,6 +22,7 @@ import argparse
 import json
 import logging
 import os
+import pickle
 import time
 from dataclasses import dataclass, asdict
 from pathlib import Path
@@ -42,7 +45,10 @@ from src.deployment import registry
 
 logger = logging.getLogger(__name__)
 
-VALID_MODELS = ("xgboost", "mlp_xgboost")
+VALID_MODELS = ("xgboost", "mlp_xgboost", "transformer_xgboost", "gnn_xgboost")
+
+# Neural hybrid model types that have an encoder stage
+_NEURAL_HYBRIDS = ("mlp_xgboost", "transformer_xgboost", "gnn_xgboost")
 
 
 # ---------------------------------------------------------------------------
@@ -83,6 +89,14 @@ class ModelResult:
 # Artifact loading
 # ---------------------------------------------------------------------------
 
+_DISK_MODEL_PATHS = {
+    "xgboost":           "models/xgboost_fraud_model.joblib",
+    "mlp_xgboost":       "models/mlp_xgboost/xgboost.joblib",
+    "transformer_xgboost": "models/transformer_xgboost/xgboost.joblib",
+    "gnn_xgboost":       "models/gnn_xgboost/xgboost.joblib",
+}
+
+
 def _load_artifacts(
     model_type: str,
     tracking_uri: str,
@@ -101,33 +115,82 @@ def _load_artifacts(
         except Exception as exc:
             logger.warning("Registry load failed for '%s' (%s) — falling back to disk.", model_type, exc)
 
-    _DISK_MODEL_PATHS = {
-        "xgboost":    "models/xgboost_fraud_model.joblib",
-        "mlp_xgboost": "models/mlp_xgboost/xgboost.joblib",
-    }
     model_path = _DISK_MODEL_PATHS.get(model_type, "models/xgboost_fraud_model.joblib")
-    pipeline = joblib.load("models/feature_pipeline.joblib")
-    model = joblib.load(model_path)
+    pipeline   = joblib.load("models/feature_pipeline.joblib")
+    model      = joblib.load(model_path)
     logger.info("Loaded '%s' artifacts from disk (%s).", model_type, model_path)
     return pipeline, model, "disk", "disk"
 
 
 def _load_encoder(model_type: str) -> Optional[Any]:
-    """Load the MLP encoder for mlp_xgboost from disk. Returns None for xgboost."""
-    if model_type != "mlp_xgboost":
+    """Load the neural encoder for hybrid models from disk.
+
+    Returns:
+        None              for xgboost
+        MLPEncoder        for mlp_xgboost
+        TabTransformerEncoder for transformer_xgboost
+        GNNArtifact       for gnn_xgboost (encoder + card lookup tables)
+    """
+    if model_type not in _NEURAL_HYBRIDS:
         return None
 
-    encoder_path = "models/mlp_xgboost/encoder.pt"
-    if not Path(encoder_path).exists():
-        return None
+    if model_type == "mlp_xgboost":
+        encoder_path = "models/mlp_xgboost/encoder.pt"
+        if not Path(encoder_path).exists():
+            return None
+        import torch
+        from src.training.models.mlp_tree import MLPEncoder
+        ckpt = torch.load(encoder_path, map_location="cpu", weights_only=False)
+        enc  = MLPEncoder(
+            input_dim=ckpt["input_dim"],
+            hidden_dims=tuple(ckpt.get("hidden_dims", [256, 128, 64])),
+        )
+        enc.load_state_dict(ckpt["model_state_dict"])
+        enc.eval()
+        return enc
 
+    if model_type == "transformer_xgboost":
+        encoder_path = "models/transformer_xgboost/encoder.pt"
+        if not Path(encoder_path).exists():
+            return None
+        import torch
+        from src.training.models.transformer_tree import TabTransformerEncoder
+        ckpt = torch.load(encoder_path, map_location="cpu", weights_only=False)
+        enc  = TabTransformerEncoder(
+            input_dim=ckpt["input_dim"],
+            d_model=ckpt.get("d_model", 64),
+            nhead=ckpt.get("nhead", 4),
+            num_layers=ckpt.get("num_layers", 2),
+            dim_feedforward=ckpt.get("dim_feedforward", 256),
+            dropout=ckpt.get("dropout", 0.1),
+        )
+        enc.load_state_dict(ckpt["model_state_dict"])
+        enc.eval()
+        return enc
+
+    # gnn_xgboost — returns GNNArtifact (encoder + card lookup tables)
+    enc_path = "models/gnn_xgboost/encoder.pt"
+    h0_path  = "models/gnn_xgboost/card_h0_mean.pkl"
+    h1_path  = "models/gnn_xgboost/card_h1_mean.pkl"
+    if not all(Path(p).exists() for p in [enc_path, h0_path, h1_path]):
+        logger.warning("GNN encoder artifacts missing — returning None.")
+        return None
     import torch
-    from src.training.models.mlp_tree import MLPEncoder
-    ckpt = torch.load(encoder_path, map_location="cpu")
-    enc = MLPEncoder(input_dim=ckpt["input_dim"], hidden_dims=(256, 128, 64))
+    from src.training.models.gnn_tree import GraphSAGEEncoder, GNNArtifact
+    ckpt = torch.load(enc_path, map_location="cpu", weights_only=False)
+    enc  = GraphSAGEEncoder(
+        input_dim=ckpt["input_dim"],
+        hidden_dim=ckpt.get("hidden_dim", 64),
+        out_dim=ckpt.get("embed_dim", 32),
+        dropout=ckpt.get("dropout", 0.1),
+    )
     enc.load_state_dict(ckpt["model_state_dict"])
     enc.eval()
-    return enc
+    with open(h0_path, "rb") as f:
+        card_h0_mean = pickle.load(f)
+    with open(h1_path, "rb") as f:
+        card_h1_mean = pickle.load(f)
+    return GNNArtifact(encoder=enc, card_h0_mean=card_h0_mean, card_h1_mean=card_h1_mean)
 
 
 def _build_input(
@@ -139,13 +202,27 @@ def _build_input(
     """Return the feature matrix the XGBoost stage expects.
 
     For xgboost: just the pipeline-processed features.
-    For mlp_xgboost: [pipeline features || encoder embeddings].
+    For mlp/transformer_xgboost: [pipeline features || encoder embeddings].
+    For gnn_xgboost: [pipeline features || GNN embeddings] using card1 from X_raw.
     """
     if encoder is None or model_type == "xgboost":
         return X_proc
 
-    from src.training.models.mlp_tree import extract_mlp_embeddings
-    embeddings = extract_mlp_embeddings(encoder, X_proc, device="cpu")
+    if model_type == "mlp_xgboost":
+        from src.training.models.mlp_tree import extract_mlp_embeddings
+        embeddings = extract_mlp_embeddings(encoder, X_proc, device="cpu")
+    elif model_type == "transformer_xgboost":
+        from src.training.models.transformer_tree import extract_transformer_embeddings
+        embeddings = extract_transformer_embeddings(encoder, X_proc, device="cpu")
+    else:  # gnn_xgboost
+        from src.training.models.gnn_tree import extract_gnn_embeddings, GNNArtifact
+        card1_values = (
+            X_raw["card1"].values
+            if X_raw is not None and "card1" in X_raw.columns
+            else None
+        )
+        embeddings = extract_gnn_embeddings(encoder, X_proc, card1_values, device="cpu")
+
     return np.hstack([X_proc, embeddings])
 
 
@@ -206,7 +283,7 @@ def _measure_latency(
     timings = []
     for i in range(n_reps + 10):
         t0 = time.perf_counter()
-        X_proc = pipeline.transform(row)
+        X_proc  = pipeline.transform(row)
         X_input = _build_input(model_type, encoder, X_proc, X_raw=row)
         _ = model.predict_proba(X_input)[:, 1]
         elapsed_ms = (time.perf_counter() - t0) * 1000
@@ -236,31 +313,30 @@ def evaluate_model(
     """Evaluate one model on the OOT test set and return a ModelResult."""
     logger.info("Evaluating '%s' on %d test samples...", model_type, len(X_test_raw))
 
-    X_proc = pipeline.transform(X_test_raw)
+    X_proc  = pipeline.transform(X_test_raw)
     X_input = _build_input(model_type, encoder, X_proc, X_raw=X_test_raw)
-    y_arr = y_test.values if hasattr(y_test, "values") else y_test
-    probs = model.predict_proba(X_input)[:, 1]
+    y_arr   = y_test.values if hasattr(y_test, "values") else y_test
+    probs   = model.predict_proba(X_input)[:, 1]
 
     # Core metrics
     metrics = evaluate_classification(y_arr, probs, threshold=0.5, max_fpr=0.05)
 
     # FPR sweep for recall@1%/2%/5% and dollar recall
-    sweep = fpr_sweep(y_arr, probs, amounts=amounts,
-                      fpr_targets=[0.01, 0.02, 0.05])
+    sweep = fpr_sweep(y_arr, probs, amounts=amounts, fpr_targets=[0.01, 0.02, 0.05])
     recall_by_fpr = {row["target_fpr_pct"]: row for row in sweep}
 
-    r1  = recall_by_fpr.get(1.0,  {}).get("recall", 0.0)
-    r2  = recall_by_fpr.get(2.0,  {}).get("recall", 0.0)
-    r5  = recall_by_fpr.get(5.0,  {}).get("recall", 0.0)
-    dr2 = recall_by_fpr.get(2.0,  {}).get("dollar_recall", 0.0)
+    r1  = recall_by_fpr.get(1.0, {}).get("recall", 0.0)
+    r2  = recall_by_fpr.get(2.0, {}).get("recall", 0.0)
+    r5  = recall_by_fpr.get(5.0, {}).get("recall", 0.0)
+    dr2 = recall_by_fpr.get(2.0, {}).get("dollar_recall", 0.0)
 
     # Latency
     p50, p99 = _measure_latency(model_type, pipeline, encoder, model, X_test_raw, n_reps=n_latency_reps)
 
     # Model complexity proxy
-    n_est = getattr(model, "n_estimators", 0)
+    n_est     = getattr(model, "n_estimators", 0)
     best_iter = getattr(model, "best_iteration", None)
-    n_trees = int(best_iter) if best_iter is not None else int(n_est)
+    n_trees   = int(best_iter) if best_iter is not None else int(n_est)
 
     logger.info(
         "%s — AUC: %.4f  PR-AUC: %.4f  pAUC@5%%: %.4f  "
@@ -315,16 +391,13 @@ def format_results_table(results: List[ModelResult]) -> str:
     """Render a GitHub-flavoured markdown table. Best value per column bolded."""
     headers = ["Model"] + [col[1] for col in _METRIC_COLS]
     rows = []
-
     for r in results:
         d = asdict(r)
         row = [r.model_name]
         for attr, _, fmt in _METRIC_COLS:
-            val = d[attr]
-            row.append(val)
+            row.append(d[attr])
         rows.append(row)
 
-    # Determine best per metric column
     best_idx: List[int] = []
     for col_idx, (attr, _, _) in enumerate(_METRIC_COLS):
         vals = [asdict(r)[attr] for r in results]
@@ -332,19 +405,17 @@ def format_results_table(results: List[ModelResult]) -> str:
         best = min(vals) if lower_better else max(vals)
         best_idx.append(vals.index(best))
 
-    # Format rows
     formatted_rows = []
     for row_idx, row in enumerate(rows):
         fmt_row = [row[0]]
         for col_idx, (attr, _, fmt) in enumerate(_METRIC_COLS):
-            val = row[col_idx + 1]
+            val  = row[col_idx + 1]
             cell = f"{val:{fmt}}"
             if row_idx == best_idx[col_idx]:
                 cell = f"**{cell}**"
             fmt_row.append(cell)
         formatted_rows.append(fmt_row)
 
-    # Build markdown
     sep = [":---"] + ["---:" for _ in _METRIC_COLS]
     lines = [
         "| " + " | ".join(headers) + " |",
@@ -373,7 +444,7 @@ def run_benchmark(
     n_latency_reps: int = 200,
 ) -> List[ModelResult]:
     """Compare champion models on the OOT test set and write reports."""
-    cfg = load_config(config_path)
+    cfg          = load_config(config_path)
     tracking_uri = cfg["training"].get("mlflow_tracking_uri", "")
 
     Path(output_dir).mkdir(parents=True, exist_ok=True)
@@ -392,7 +463,7 @@ def run_benchmark(
             pipeline, model, run_id, source = _load_artifacts(model_type, tracking_uri)
             encoder = _load_encoder(model_type)
             version = _get_model_version(model_type, tracking_uri)
-            result = evaluate_model(
+            result  = evaluate_model(
                 model_type=model_type,
                 pipeline=pipeline,
                 encoder=encoder,
@@ -414,14 +485,12 @@ def run_benchmark(
         logger.warning("No models successfully evaluated.")
         return results
 
-    # Write JSON
     json_path = os.path.join(output_dir, "benchmark_results.json")
     with open(json_path, "w") as f:
         json.dump([asdict(r) for r in results], f, indent=2)
     logger.info("Benchmark results written to %s", json_path)
 
-    # Write markdown table
-    table = format_results_table(results)
+    table   = format_results_table(results)
     md_path = os.path.join(output_dir, "benchmark_results.md")
     with open(md_path, "w") as f:
         f.write("# Model Benchmark Results\n\n")
@@ -453,26 +522,19 @@ if __name__ == "__main__":
     parser.add_argument("--trans",  required=True, help="Path to raw transaction CSV")
     parser.add_argument("--id",     required=True, help="Path to raw identity CSV")
     parser.add_argument(
-        "--models",
-        nargs="+",
-        default=list(VALID_MODELS),
-        choices=list(VALID_MODELS),
-        help="Model types to benchmark (default: all)",
+        "--models", nargs="+", default=list(VALID_MODELS),
+        choices=list(VALID_MODELS), help="Model types to benchmark (default: all)",
     )
     parser.add_argument(
-        "--output",
-        default="reports/benchmark",
+        "--output", default="reports/benchmark",
         help="Output directory for reports (default: reports/benchmark)",
     )
     parser.add_argument(
-        "--config",
-        default=None,
+        "--config", default=None,
         help="Path to YAML config (default: configs/model_config.yaml)",
     )
     parser.add_argument(
-        "--latency-reps",
-        type=int,
-        default=200,
+        "--latency-reps", type=int, default=200,
         help="Number of single-sample latency measurements per model (default: 200)",
     )
     args = parser.parse_args()

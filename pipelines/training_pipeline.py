@@ -181,7 +181,7 @@ def training_pipeline(
     config_path:
         Path to YAML config (uses default if None).
     model_type:
-        Model type to train (xgboost, mlp_xgboost).
+        Model type to train (xgboost, mlp_xgboost, transformer_xgboost, gnn_xgboost).
     n_trials:
         Number of Optuna trials for the tuning step.
     auto_promote:

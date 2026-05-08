@@ -7,6 +7,8 @@ Alias convention (MLflow 2.x — stage transitions are deprecated):
 One registered model per model_type:
     fraud_detection_xgboost
     fraud_detection_mlp_xgboost
+    fraud_detection_transformer_xgboost
+    fraud_detection_gnn_xgboost
 """
 
 import logging
@@ -25,16 +27,20 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 MODEL_NAME_MAP: dict = {
-    "xgboost":     "fraud_detection_xgboost",
-    "mlp_xgboost": "fraud_detection_mlp_xgboost",
+    "xgboost":             "fraud_detection_xgboost",
+    "mlp_xgboost":         "fraud_detection_mlp_xgboost",
+    "transformer_xgboost": "fraud_detection_transformer_xgboost",
+    "gnn_xgboost":         "fraud_detection_gnn_xgboost",
 }
 
 # Canonical artifact path logged by train.py for each model type.
 # All model-specific training functions log their final XGBoost model to this
 # path so the registry can locate it unambiguously regardless of the tuning path.
 CANONICAL_XGB_ARTIFACT: dict = {
-    "xgboost":     "xgboost_model",
-    "mlp_xgboost": "mlp_xgboost_final_model",
+    "xgboost":             "xgboost_model",
+    "mlp_xgboost":         "mlp_xgboost_final_model",
+    "transformer_xgboost": "transformer_xgboost_final_model",
+    "gnn_xgboost":         "gnn_xgboost_final_model",
 }
 
 

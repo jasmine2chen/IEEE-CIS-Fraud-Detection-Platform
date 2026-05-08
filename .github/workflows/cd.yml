@@ -9,6 +9,20 @@ on:
         description: 'Model type to deploy'
         required: false
         default: 'xgboost'
+        type: choice
+        options:
+          - xgboost
+          - mlp_xgboost
+          - transformer_xgboost
+          - gnn_xgboost
+
+env:
+  AWS_REGION: ${{ secrets.AWS_REGION }}
+  ECR_REPOSITORY: ${{ secrets.ECR_REPOSITORY }}
+  ECS_CLUSTER: ${{ secrets.ECS_CLUSTER }}
+  ECS_SERVICE: ${{ secrets.ECS_SERVICE }}
+  ECS_TASK_DEFINITION: ${{ secrets.ECS_TASK_DEFINITION }}
+  CONTAINER_NAME: ${{ secrets.CONTAINER_NAME }}
 
 jobs:
   integration-test:
@@ -36,41 +50,97 @@ jobs:
 
       - name: Registry import check
         run: |
-          python -c "from src.deployment.registry import MODEL_NAME_MAP; print('registry ok')"
+          python -c "
+          from src.deployment.registry import MODEL_NAME_MAP
+          assert set(MODEL_NAME_MAP.keys()) == {'xgboost','mlp_xgboost','transformer_xgboost','gnn_xgboost'}
+          print('registry ok —', list(MODEL_NAME_MAP.keys()))
+          "
 
-  build-and-push:
-    name: Build & Push Docker Image
+  build-and-push-ecr:
+    name: Build & Push to ECR
     runs-on: ubuntu-latest
     needs: integration-test
+    outputs:
+      image: ${{ steps.build-image.outputs.image }}
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Log in to Docker Hub
-        if: ${{ secrets.DOCKER_USERNAME != '' }}
-        uses: docker/login-action@v3
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
         with:
-          username: ${{ secrets.DOCKER_USERNAME }}
-          password: ${{ secrets.DOCKER_PASSWORD }}
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
 
-      - name: Build Docker image
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build, tag, and push image to ECR
+        id: build-image
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          IMAGE_TAG: ${{ github.sha }}
         run: |
           docker build \
-            -t ${{ secrets.DOCKER_USERNAME }}/fraud-detection-api:${{ github.sha }} \
-            -t ${{ secrets.DOCKER_USERNAME }}/fraud-detection-api:latest \
+            -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG \
+            -t $ECR_REGISTRY/$ECR_REPOSITORY:latest \
             .
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:latest
+          echo "image=$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" >> "$GITHUB_OUTPUT"
 
-      - name: Push Docker image
-        if: ${{ secrets.DOCKER_USERNAME != '' }}
+  deploy-ecs:
+    name: Deploy to ECS
+    runs-on: ubuntu-latest
+    needs: build-and-push-ecr
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Download current ECS task definition
         run: |
-          docker push ${{ secrets.DOCKER_USERNAME }}/fraud-detection-api:${{ github.sha }}
-          docker push ${{ secrets.DOCKER_USERNAME }}/fraud-detection-api:latest
+          aws ecs describe-task-definition \
+            --task-definition ${{ env.ECS_TASK_DEFINITION }} \
+            --query taskDefinition \
+            > task-definition.json
+
+      - name: Render new ECS task definition with updated image
+        id: render-task-def
+        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        with:
+          task-definition: task-definition.json
+          container-name: ${{ env.CONTAINER_NAME }}
+          image: ${{ needs.build-and-push-ecr.outputs.image }}
+          environment-variables: |
+            MODEL_TYPE=${{ github.event.inputs.model_type || 'xgboost' }}
+            MLFLOW_TRACKING_URI=${{ secrets.MLFLOW_TRACKING_URI }}
+            S3_CONFIG_BUCKET=${{ secrets.S3_CONFIG_BUCKET }}
+            S3_CONFIG_KEY=configs/model_config.yaml
+
+      - name: Deploy updated task definition to ECS service
+        uses: aws-actions/amazon-ecs-deploy-task-definition@v2
+        with:
+          task-definition: ${{ steps.render-task-def.outputs.task-definition }}
+          service: ${{ env.ECS_SERVICE }}
+          cluster: ${{ env.ECS_CLUSTER }}
+          wait-for-service-stability: true
+          wait-for-minutes: 10
 
   notify:
     name: Deployment Notification
     runs-on: ubuntu-latest
-    needs: build-and-push
+    needs: [build-and-push-ecr, deploy-ecs]
     if: always()
 
     steps:
@@ -79,19 +149,50 @@ jobs:
           echo "=========================================="
           echo "  Fraud Detection — Deployment Summary"
           echo "=========================================="
-          echo "  Commit SHA : ${{ github.sha }}"
-          echo "  Branch     : ${{ github.ref_name }}"
-          echo "  Model type : ${{ github.event.inputs.model_type || 'xgboost' }}"
-          echo "  Timestamp  : $(date -u +%Y-%m-%dT%H:%M:%SZ)"
-          echo "  Status     : ${{ needs.build-and-push.result }}"
+          echo "  Commit SHA  : ${{ github.sha }}"
+          echo "  Branch      : ${{ github.ref_name }}"
+          echo "  Model type  : ${{ github.event.inputs.model_type || 'xgboost' }}"
+          echo "  ECR image   : ${{ needs.build-and-push-ecr.outputs.image }}"
+          echo "  ECS cluster : ${{ env.ECS_CLUSTER }}"
+          echo "  ECS service : ${{ env.ECS_SERVICE }}"
+          echo "  Timestamp   : $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          echo "  Build status: ${{ needs.build-and-push-ecr.result }}"
+          echo "  Deploy status: ${{ needs.deploy-ecs.result }}"
           echo "=========================================="
-          echo ""
-          echo "Stub: replace with Slack webhook, PagerDuty event, or"
-          echo "      your preferred notification integration."
-          echo ""
-          echo "Example Slack step:"
-          echo "  uses: slackapi/slack-github-action@v1"
-          echo "  with:"
-          echo "    payload: '{\"text\": \"Deployed fraud-detection-api:${{ github.sha }}\"}'"
-          echo "  env:"
-          echo "    SLACK_WEBHOOK_URL: \${{ secrets.SLACK_WEBHOOK_URL }}"
+
+      - name: Notify Slack on success
+        if: ${{ needs.deploy-ecs.result == 'success' && secrets.SLACK_WEBHOOK_URL != '' }}
+        uses: slackapi/slack-github-action@v2
+        with:
+          payload: |
+            {
+              "text": ":white_check_mark: *fraud-detection-api* deployed to ECS",
+              "attachments": [{
+                "color": "good",
+                "fields": [
+                  {"title": "Commit", "value": "${{ github.sha }}", "short": true},
+                  {"title": "Model", "value": "${{ github.event.inputs.model_type || 'xgboost' }}", "short": true},
+                  {"title": "Image", "value": "${{ needs.build-and-push-ecr.outputs.image }}", "short": false}
+                ]
+              }]
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+
+      - name: Notify Slack on failure
+        if: ${{ needs.deploy-ecs.result == 'failure' && secrets.SLACK_WEBHOOK_URL != '' }}
+        uses: slackapi/slack-github-action@v2
+        with:
+          payload: |
+            {
+              "text": ":x: *fraud-detection-api* ECS deployment FAILED — <${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|View run>",
+              "attachments": [{
+                "color": "danger",
+                "fields": [
+                  {"title": "Commit", "value": "${{ github.sha }}", "short": true},
+                  {"title": "Branch", "value": "${{ github.ref_name }}", "short": true}
+                ]
+              }]
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}

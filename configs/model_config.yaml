@@ -8,7 +8,7 @@ data:
   processed_dir: "data/processed"
 
 model:
-  type: "xgboost" # Options: xgboost, mlp_xgboost
+  type: "xgboost"  # Options: xgboost, mlp_xgboost, transformer_xgboost, gnn_xgboost
   target_col: "isFraud"
   random_state: 42
 
@@ -35,8 +35,45 @@ mlp_xgboost_params:
   xgb_early_stopping_rounds: 30
   tree_method: "hist"
 
+transformer_xgboost_params:
+  # Stage 1 — FT-Transformer encoder
+  d_model: 64              # per-feature embedding dimension
+  nhead: 4                 # attention heads (must divide d_model)
+  num_layers: 2            # TransformerEncoder layers
+  dim_feedforward: 256     # FFN hidden dim
+  dropout_rate: 0.1
+  learning_rate: 0.0005
+  encoder_epochs: 20
+  batch_size: 512
+  patience: 5              # FPR early-stopping patience (epochs)
+  # Stage 2 — XGBoost on [orig || transformer_embed]
+  n_estimators: 300
+  max_depth: 6
+  subsample: 0.8
+  colsample_bytree: 0.8
+  xgb_early_stopping_rounds: 30
+  tree_method: "hist"
+
+gnn_xgboost_params:
+  # Stage 1 — GraphSAGE encoder
+  hidden_dim: 64           # SAGEConv layer 1 output dim
+  out_dim: 32              # SAGEConv layer 2 output dim (embedding size)
+  dropout_rate: 0.1
+  learning_rate: 0.001
+  encoder_epochs: 15
+  batch_size: 2048
+  max_neighbors: 30        # max card1 neighbors sampled per transaction
+  patience: 5              # FPR early-stopping patience (epochs)
+  # Stage 2 — XGBoost on [orig || gnn_embed]
+  n_estimators: 300
+  max_depth: 6
+  subsample: 0.8
+  colsample_bytree: 0.8
+  xgb_early_stopping_rounds: 30
+  tree_method: "hist"
+
 training:
-  cv_strategy: "time_consistency" # Months 0-5 train -> Predict Month 6
+  cv_strategy: "time_consistency"  # Months 0-5 train -> Predict Month 6
   early_stopping_rounds: 50
   mlflow_experiment_name: "fraud_detection_ieee"
   mlflow_tracking_uri: "sqlite:///mlruns.db"
@@ -44,8 +81,19 @@ training:
 xgboost_selected_features: null  # populated by tune.py XGBoost L1 RFE; null = use all features
 
 # Hybrid model outputs — populated by tune.py _run_hybrid_pipeline; null = use all features
-mlp_xgboost_stage2_params: null   # Phase B XGBoost params (trained on frozen MLP embeddings)
-mlp_xgboost_selected: null        # Phase B L2 RFE indices into [orig || mlp_embed] matrix
+mlp_xgboost_stage2_params: null         # Phase B XGBoost params (trained on frozen MLP embeddings)
+mlp_xgboost_selected: null              # Phase B L2 RFE indices into [orig || mlp_embed] matrix
+transformer_xgboost_stage2_params: null # Phase B XGBoost params for transformer hybrid
+transformer_xgboost_selected: null      # Phase B L2 RFE indices into [orig || transformer_embed]
+gnn_xgboost_stage2_params: null         # Phase B XGBoost params for GNN hybrid
+gnn_xgboost_selected: null              # Phase B L2 RFE indices into [orig || gnn_embed]
+
+# S3 config writeback — set S3_CONFIG_BUCKET env var to enable zero-code scheduled retraining.
+# tune.py reads S3_CONFIG_BUCKET and (optionally) S3_CONFIG_KEY from the environment and uploads
+# the updated model_config.yaml after each tuning run so that downstream ECS retraining jobs
+# always pull the latest HPO-discovered hyperparameters without a code deploy.
+# s3_config_bucket: ""   # override via S3_CONFIG_BUCKET env var
+# s3_config_key: "configs/model_config.yaml"  # override via S3_CONFIG_KEY env var
 
 tuning:
   n_trials: 50
@@ -75,6 +123,28 @@ tuning:
     rfe_n_features_min: 20
     rfe_stability_k: 2.0
     retune_n_trials: 20
+    variance_threshold: 0.03
+  transformer_xgboost:
+    study_name: "transformer_xgboost_fraud_tuning"
+    encoder_n_trials: 20           # Phase A: encoder HPO trials (FT-Transformer is expensive)
+    early_stopping_rounds: 50
+    cv_folds: 3
+    cv_fold_weights: [1, 2, 3]
+    rfe_step: 10
+    rfe_n_features_min: 20
+    rfe_stability_k: 2.0
+    retune_n_trials: 15
+    variance_threshold: 0.03
+  gnn_xgboost:
+    study_name: "gnn_xgboost_fraud_tuning"
+    encoder_n_trials: 15           # Phase A: GNN encoder HPO trials (historical agg is expensive)
+    early_stopping_rounds: 50
+    cv_folds: 3
+    cv_fold_weights: [1, 2, 3]
+    rfe_step: 10
+    rfe_n_features_min: 20
+    rfe_stability_k: 2.0
+    retune_n_trials: 10
     variance_threshold: 0.03
 
 serving:

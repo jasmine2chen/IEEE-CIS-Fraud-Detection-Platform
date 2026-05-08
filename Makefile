@@ -6,7 +6,7 @@
 MODEL   ?= xgboost
 TRIALS  ?= 50
 OUTPUT  ?= data/predictions/batch_$(shell date +%Y%m%d).parquet
-MODELS  ?= xgboost mlp_xgboost
+MODELS  ?= xgboost mlp_xgboost transformer_xgboost gnn_xgboost
 BENCH_OUT ?= reports/benchmark
 ABL_OUT   ?= reports/ablation
 

@@ -1,4 +1,4 @@
-"""Hyperparameter tuning via Optuna — supports XGBoost and MLP+XGBoost.
+"""Hyperparameter tuning via Optuna — supports XGBoost, MLP+XGBoost, Transformer+XGBoost, GNN+XGBoost.
 
 Shared design principles
 ------------------------
@@ -7,6 +7,8 @@ Shared design principles
 - Each trial logs params + metrics to a nested MLflow child run.
 - On completion, best params are written back to model_config.yaml so
   train.py picks them up with no code change (YAML = single source of truth).
+- When S3_CONFIG_BUCKET env var is set, the updated config is also uploaded
+  to S3 — enabling zero-code scheduled retraining from the pipeline.
 
 XGBoost — four-step pipeline (_run_xgb_pipeline)
 -------------------------------------------------
@@ -24,33 +26,37 @@ Step 3 — Re-tune HPO (selected features, recency-weighted CV)
 Step 4 — Stability validation
     var(fold FPRs) < variance_threshold (default 0.03).
 
-MLP+XGBoost — two-phase pipeline (_run_hybrid_pipeline)
----------------------------------------------------------
+Neural hybrids (mlp_xgboost, transformer_xgboost, gnn_xgboost) — two-phase pipeline
+-------------------------------------------------------------------------------------
 Phase A — Encoder HPO (OOT evaluation, encoder params only)
     After HPO, the best encoder is retrained on the full dev set. Encoder frozen.
+    GNN additionally receives card1 arrays for neighbourhood construction.
 
 Phase B — XGBoost optimisation on frozen embeddings
-    B1: Extract [original_features || MLP_embeddings] combined matrix once.
+    B1: Extract [original_features || encoder_embeddings] combined matrix once.
     B2: Level-2 RFE on combined matrix.
     B3: XGBoost re-HPO on selected combined features.
     B4: Stability gate.
 
 Usage
 -----
-    make tune                                      # XGBoost, 50 trials
-    make tune MODEL=mlp_xgboost TRIALS=30          # MLP→XGBoost, 30 trials
-    make tune-then-train                           # tune → update YAML → retrain
+    make tune                                          # XGBoost, 50 trials
+    make tune MODEL=mlp_xgboost TRIALS=30             # MLP→XGBoost, 30 trials
+    make tune MODEL=transformer_xgboost TRIALS=30     # Transformer→XGBoost
+    make tune MODEL=gnn_xgboost TRIALS=20             # GNN→XGBoost
+    make tune-then-train                              # tune → update YAML → retrain
 """
 
 import argparse
 import logging
+import os
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
-import pandas as pd
 import mlflow
 import numpy as np
 import optuna
+import pandas as pd
 import torch
 import yaml
 from sklearn.metrics import roc_auc_score
@@ -60,6 +66,8 @@ from src.config import load_config
 from src.preprocessing.data_loader import prepare_data
 from src.feature_engineering.build_features import get_full_pipeline
 from src.training.models.mlp_tree import extract_mlp_embeddings, train_mlp_xgboost
+from src.training.models.transformer_tree import extract_transformer_embeddings, train_transformer_xgboost
+from src.training.models.gnn_tree import GNNArtifact, extract_gnn_embeddings, train_gnn_xgboost
 from src.training.models.tree_models import make_fpr_eval_metric
 from src.training.train import time_consistency_split
 
@@ -69,6 +77,8 @@ logger = logging.getLogger(__name__)
 
 # tune.py lives at src/training/tune.py — three levels up to repo root.
 _CONFIG_PATH = Path(__file__).parent.parent.parent / "configs" / "model_config.yaml"
+
+VALID_MODELS = ("xgboost", "mlp_xgboost", "transformer_xgboost", "gnn_xgboost")
 
 optuna.logging.set_verbosity(optuna.logging.WARNING)
 
@@ -93,61 +103,54 @@ def _sample_xgb_params(trial: optuna.Trial) -> Dict[str, Any]:
     }
 
 
-def _sample_mlp_xgboost_params(trial: optuna.Trial) -> Dict[str, Any]:
-    """MLP→XGBoost search space."""
+def _sample_mlp_encoder_params(trial: optuna.Trial) -> Dict[str, Any]:
+    """MLP encoder-only search space for Phase A HPO."""
     hidden_size = trial.suggest_categorical("hidden_size", ["small", "medium", "large"])
-    dims_map = {
-        "small":  [256, 128, 64],
-        "medium": [512, 256, 128],
-        "large":  [512, 256, 128, 64],
-    }
+    dims_map = {"small": [256, 128, 64], "medium": [512, 256, 128], "large": [512, 256, 128, 64]}
     return {
-        # Encoder
         "hidden_dims":    dims_map[hidden_size],
         "dropout_rate":   trial.suggest_float("dropout_rate", 0.1, 0.5),
         "learning_rate":  trial.suggest_float("learning_rate", 1e-4, 1e-2, log=True),
         "encoder_epochs": trial.suggest_int("encoder_epochs", 10, 30),
         "batch_size":     trial.suggest_categorical("batch_size", [512, 1024, 2048]),
         "patience":       5,
-        # XGBoost (second stage)
-        "n_estimators":   trial.suggest_int("xgb_n_estimators", 100, 600),
-        "max_depth":      trial.suggest_int("xgb_max_depth", 3, 9),
-        "subsample":      trial.suggest_float("xgb_subsample", 0.5, 1.0),
-        "colsample_bytree": trial.suggest_float("xgb_colsample_bytree", 0.5, 1.0),
-        "xgb_early_stopping_rounds": 30,
-        "tree_method":    "hist",
     }
 
 
-# ---------------------------------------------------------------------------
-# Encoder-only search space (Phase A — hybrid pipeline)
-# ---------------------------------------------------------------------------
-
-def _sample_mlp_encoder_params(trial: optuna.Trial) -> Dict[str, Any]:
-    """MLP encoder-only search space for Phase A HPO."""
+def _sample_transformer_encoder_params(trial: optuna.Trial) -> Dict[str, Any]:
+    """TabTransformer encoder-only search space for Phase A HPO."""
     return {
-        "hidden_size":    trial.suggest_categorical("hidden_size",
-                                                    ["small", "medium", "large"]),
-        "dropout_rate":   trial.suggest_float("dropout_rate", 0.1, 0.5),
-        "learning_rate":  trial.suggest_float("learning_rate", 1e-4, 1e-2, log=True),
+        "d_model":        trial.suggest_categorical("d_model", [32, 64, 128]),
+        "nhead":          trial.suggest_categorical("nhead", [2, 4, 8]),
+        "num_layers":     trial.suggest_int("num_layers", 1, 4),
+        "dim_feedforward": trial.suggest_categorical("dim_feedforward", [128, 256, 512]),
+        "dropout_rate":   trial.suggest_float("dropout_rate", 0.05, 0.3),
+        "learning_rate":  trial.suggest_float("learning_rate", 1e-4, 5e-3, log=True),
         "encoder_epochs": trial.suggest_int("encoder_epochs", 10, 30),
-        "batch_size":     trial.suggest_categorical("batch_size", [512, 1024, 2048]),
+        "batch_size":     trial.suggest_categorical("batch_size", [256, 512, 1024]),
+        "patience":       5,
+    }
+
+
+def _sample_gnn_encoder_params(trial: optuna.Trial) -> Dict[str, Any]:
+    """GraphSAGE encoder-only search space for Phase A HPO."""
+    return {
+        "hidden_dim":     trial.suggest_categorical("hidden_dim", [32, 64, 128]),
+        "out_dim":        trial.suggest_categorical("out_dim", [16, 32, 64]),
+        "dropout_rate":   trial.suggest_float("dropout_rate", 0.05, 0.3),
+        "learning_rate":  trial.suggest_float("learning_rate", 5e-4, 5e-3, log=True),
+        "encoder_epochs": trial.suggest_int("encoder_epochs", 5, 20),
+        "batch_size":     trial.suggest_categorical("batch_size", [1024, 2048, 4096]),
+        "max_neighbors":  trial.suggest_categorical("max_neighbors", [20, 30, 50]),
         "patience":       5,
     }
 
 
 def _resolve_encoder_params(model_type: str, best_params: Dict[str, Any]) -> Dict[str, Any]:
-    """Convert Optuna best_params to actual model params.
-
-    MLP: hidden_size categorical string → hidden_dims list.
-    """
+    """Convert Optuna best_params to actual model params (e.g. hidden_size → hidden_dims)."""
     params = dict(best_params)
     if model_type == "mlp_xgboost" and "hidden_size" in params:
-        dims_map = {
-            "small":  [256, 128, 64],
-            "medium": [512, 256, 128],
-            "large":  [512, 256, 128, 64],
-        }
+        dims_map = {"small": [256, 128, 64], "medium": [512, 256, 128], "large": [512, 256, 128, 64]}
         params["hidden_dims"] = dims_map[params.pop("hidden_size")]
     return params
 
@@ -280,12 +283,11 @@ def _rfe_xgboost(
             X_train, y_train, cv_folds, clean_params, fpr_threshold,
             early_stopping_rounds, feature_idx=feature_idx,
         )
-        mean_fpr = float(np.mean(fold_fprs))
-        std_fpr  = float(np.std(fold_fprs))
-        score    = _rfe_score(fold_fprs, k=stability_k)
+        score = _rfe_score(fold_fprs, k=stability_k)
 
         logger.info("RFE: %d features — mean_FPR=%.4f  std=%.4f  ucb_score=%.4f",
-                    len(feature_idx), mean_fpr, std_fpr, score)
+                    len(feature_idx), float(np.mean(fold_fprs)),
+                    float(np.std(fold_fprs)), score)
 
         if score <= best_score:
             best_score = score
@@ -304,6 +306,10 @@ def _rfe_xgboost(
     return best_feature_idx.tolist()
 
 
+# ---------------------------------------------------------------------------
+# XGBoost four-step pipeline
+# ---------------------------------------------------------------------------
+
 def _run_xgb_pipeline(
     X_train: np.ndarray,
     y_train: np.ndarray,
@@ -316,14 +322,12 @@ def _run_xgb_pipeline(
     """Four-step XGBoost training pipeline."""
     early_stopping_rounds = model_tuning.get("early_stopping_rounds", 50)
     n_cv_folds            = model_tuning.get("cv_folds", 3)
-    cv_fold_weights       = model_tuning.get("cv_fold_weights",
-                                             list(range(1, n_cv_folds + 1)))
+    cv_fold_weights       = model_tuning.get("cv_fold_weights", list(range(1, n_cv_folds + 1)))
     rfe_stability_k       = model_tuning.get("rfe_stability_k", 2.0)
     variance_threshold    = model_tuning.get("variance_threshold", 0.03)
     n_features_min        = model_tuning.get("rfe_n_features_min", 20)
     rfe_step              = model_tuning.get("rfe_step", 10)
-    retune_n_trials       = model_tuning.get("retune_n_trials",
-                                             max(n_trials // 2, 20))
+    retune_n_trials       = model_tuning.get("retune_n_trials", max(n_trials // 2, 20))
     base_study_name       = model_tuning.get("study_name", "xgboost_fraud_tuning")
 
     cv_folds = _make_temporal_cv_folds(month_arr, n_folds=n_cv_folds)
@@ -334,17 +338,13 @@ def _run_xgb_pipeline(
     logger.info("=== Step 1: Initial HPO on all %d features ===", X_train.shape[1])
     study_1 = _run_xgb_study(
         X_train, y_train, cv_folds, cv_fold_weights,
-        early_stopping_rounds, fpr_threshold,
-        n_trials=n_trials,
-        study_name=base_study_name,
-        parent_run_id=parent_run_id,
-        feature_idx=None,
+        early_stopping_rounds, fpr_threshold, n_trials=n_trials,
+        study_name=base_study_name, parent_run_id=parent_run_id, feature_idx=None,
     )
     best_params_1 = dict(study_1.best_params)
     best_params_1["tree_method"] = "hist"
     best_params_1["eval_metric"] = "auc"
     mlflow.log_metric("step1_best_weighted_FPR", study_1.best_value)
-    mlflow.set_tag("step1_best_trial", study_1.best_trial.number)
     logger.info("Step 1 complete. Best weighted FPR=%.4f (trial %d)",
                 study_1.best_value, study_1.best_trial.number)
 
@@ -357,36 +357,27 @@ def _run_xgb_pipeline(
     )
     feat_idx = np.array(selected_features)
     mlflow.log_param("n_selected_features", len(selected_features))
-    logger.info("Step 2 complete. Selected %d features.", len(selected_features))
 
     logger.info("=== Step 3: Re-tune HPO on %d features (%d trials) ===",
                 len(selected_features), retune_n_trials)
     study_3 = _run_xgb_study(
         X_train, y_train, cv_folds, cv_fold_weights,
-        early_stopping_rounds, fpr_threshold,
-        n_trials=retune_n_trials,
-        study_name=base_study_name + "_retune",
-        parent_run_id=parent_run_id,
+        early_stopping_rounds, fpr_threshold, n_trials=retune_n_trials,
+        study_name=base_study_name + "_retune", parent_run_id=parent_run_id,
         feature_idx=feat_idx,
     )
     best_params_final = dict(study_3.best_params)
     best_params_final["tree_method"] = "hist"
     best_params_final["eval_metric"] = "auc"
     mlflow.log_metric("step3_best_weighted_FPR", study_3.best_value)
-    mlflow.set_tag("step3_best_trial", study_3.best_trial.number)
-    logger.info("Step 3 complete. Best weighted FPR=%.4f (trial %d)",
-                study_3.best_value, study_3.best_trial.number)
 
-    logger.info("=== Step 4: Stability validation (threshold=%.3f) ===",
-                variance_threshold)
+    logger.info("=== Step 4: Stability validation (threshold=%.3f) ===", variance_threshold)
     final_fold_fprs = _cv_xgb_fold_fprs(
         X_train, y_train, cv_folds, best_params_final,
         fpr_threshold, early_stopping_rounds, feature_idx=feat_idx,
     )
-    cv_mean     = float(np.mean(final_fold_fprs))
-    cv_std      = float(np.std(final_fold_fprs))
-    cv_variance = float(np.var(final_fold_fprs))
-
+    cv_mean, cv_std = float(np.mean(final_fold_fprs)), float(np.std(final_fold_fprs))
+    cv_variance     = float(np.var(final_fold_fprs))
     mlflow.log_metric("final_CV_FPR_mean",     cv_mean)
     mlflow.log_metric("final_CV_FPR_std",      cv_std)
     mlflow.log_metric("final_CV_FPR_variance", cv_variance)
@@ -399,10 +390,8 @@ def _run_xgb_pipeline(
         logger.info("Step 4 PASSED: variance=%.4f < %.3f  (mean=%.4f  std=%.4f)",
                     cv_variance, variance_threshold, cv_mean, cv_std)
     else:
-        logger.warning(
-            "Step 4 FAILED: variance=%.4f >= %.3f  (mean=%.4f  std=%.4f).",
-            cv_variance, variance_threshold, cv_mean, cv_std,
-        )
+        logger.warning("Step 4 FAILED: variance=%.4f >= %.3f  (mean=%.4f  std=%.4f).",
+                       cv_variance, variance_threshold, cv_mean, cv_std)
 
     return best_params_final, selected_features, study_3
 
@@ -428,25 +417,26 @@ def _build_xgb_objective(
             with mlflow.start_run(run_name=f"xgb_trial_{trial.number:04d}", nested=True):
                 mlflow.log_params({k: v for k, v in params.items() if k != "tree_method"})
                 mlflow.set_tag("trial_number", trial.number)
-
-                fold_fprs = _cv_xgb_fold_fprs(
+                fold_fprs    = _cv_xgb_fold_fprs(
                     X_train, y_train, cv_folds, params,
-                    fpr_threshold, early_stopping_rounds,
-                    feature_idx=feature_idx,
+                    fpr_threshold, early_stopping_rounds, feature_idx=feature_idx,
                 )
                 weighted_fpr = _weighted_mean_fpr(fold_fprs, cv_fold_weights)
-
                 mlflow.log_metric("CV_weighted_FPR", weighted_fpr)
                 for i, f in enumerate(fold_fprs):
                     mlflow.log_metric(f"fold_{i}_FPR", f)
                 logger.info("XGB trial %d — weighted_FPR=%.4f  folds=%s",
-                            trial.number, weighted_fpr,
-                            [f"{v:.4f}" for v in fold_fprs])
+                            trial.number, weighted_fpr, [f"{v:.4f}" for v in fold_fprs])
         return weighted_fpr
     return objective
 
 
-def _build_hybrid_encoder_objective(
+# ---------------------------------------------------------------------------
+# Generic neural-hybrid Phase A + B pipeline
+# ---------------------------------------------------------------------------
+
+def _build_neural_encoder_objective(
+    model_type: str,
     X_train: np.ndarray,
     y_train: np.ndarray,
     X_test: np.ndarray,
@@ -455,55 +445,79 @@ def _build_hybrid_encoder_objective(
     fpr_threshold: float,
     parent_run_id: str,
     device: str,
+    sample_enc_fn,
+    card1_train: Optional[np.ndarray] = None,
+    card1_test:  Optional[np.ndarray] = None,
 ):
-    """Optuna objective for MLP encoder-only HPO (Phase A).
-
-    Search space: encoder architecture params only.
-    XGBoost stage uses fixed base config params as a scoring proxy.
-    Metric: OOT FPR of the full two-stage model at fpr_threshold.
-    """
+    """Optuna Phase A objective — encoder architecture HPO, fixed XGBoost proxy."""
     def objective(trial: optuna.Trial) -> float:
-        raw_enc_params = _sample_mlp_encoder_params(trial)
-        enc_params = _resolve_encoder_params("mlp_xgboost", raw_enc_params)
-        combined = {**fixed_xgb_params, **enc_params}
+        raw_enc_params = sample_enc_fn(trial)
+        enc_params     = _resolve_encoder_params(model_type, raw_enc_params)
+        combined       = {**fixed_xgb_params, **enc_params}
 
         with mlflow.start_run(run_id=parent_run_id, nested=False):
             with mlflow.start_run(
-                run_name=f"mlp_xgboost_enc_trial_{trial.number:04d}", nested=True
+                run_name=f"{model_type}_enc_trial_{trial.number:04d}", nested=True
             ):
                 mlflow.log_params({k: v for k, v in enc_params.items()
-                                   if k not in ("epochs", "patience",
-                                                "encoder_epochs", "tree_method")})
+                                   if k not in ("epochs", "patience", "encoder_epochs",
+                                                "tree_method")})
                 mlflow.set_tag("phase", "A_encoder_hpo")
+                mlflow.set_tag("model_type", model_type)
                 mlflow.set_tag("trial_number", trial.number)
 
-                encoder, xgb_model = train_mlp_xgboost(
-                    X_train, y_train, X_test, y_test,
-                    params=combined, fpr_threshold=fpr_threshold,
-                    device=device, save_path=None,
-                )
-                embed_test      = extract_mlp_embeddings(encoder, X_test, device=device)
-                X_test_enriched = np.concatenate([X_test, embed_test], axis=1)
+                try:
+                    if model_type == "mlp_xgboost":
+                        encoder, xgb = train_mlp_xgboost(
+                            X_train, y_train, X_test, y_test,
+                            params=combined, fpr_threshold=fpr_threshold,
+                            device=device, save_path=None,
+                        )
+                        embed_test = extract_mlp_embeddings(encoder, X_test, device=device)
+                    elif model_type == "transformer_xgboost":
+                        encoder, xgb = train_transformer_xgboost(
+                            X_train, y_train, X_test, y_test,
+                            params=combined, fpr_threshold=fpr_threshold,
+                            device=device, save_path=None,
+                        )
+                        embed_test = extract_transformer_embeddings(encoder, X_test, device=device)
+                    else:  # gnn_xgboost
+                        artifact, xgb = train_gnn_xgboost(
+                            X_train, y_train, X_test, y_test,
+                            card1_train=card1_train, card1_test=card1_test,
+                            params=combined, fpr_threshold=fpr_threshold,
+                            device="cpu", save_path=None,
+                        )
+                        embed_test = extract_gnn_embeddings(
+                            artifact, X_test, card1_test, device="cpu"
+                        )
+                        encoder = artifact  # reuse name for unified code path below
 
-                probs        = xgb_model.predict_proba(X_test_enriched)[:, 1]
-                y_v          = y_test.values if hasattr(y_test, "values") else y_test
-                preds_binary = (probs >= fpr_threshold).astype(int)
-                negatives    = y_v == 0
-                fp           = int(((preds_binary == 1) & negatives).sum())
-                tn           = int(((preds_binary == 0) & negatives).sum())
-                trial_fpr    = fp / (fp + tn + 1e-8)
-                auc          = float(roc_auc_score(y_v, probs))
+                    X_test_enriched = np.concatenate([X_test, embed_test], axis=1)
+                    probs        = xgb.predict_proba(X_test_enriched)[:, 1]
+                    y_v          = y_test.values if hasattr(y_test, "values") else y_test
+                    preds_binary = (probs >= fpr_threshold).astype(int)
+                    negatives    = y_v == 0
+                    fp           = int(((preds_binary == 1) & negatives).sum())
+                    tn           = int(((preds_binary == 0) & negatives).sum())
+                    trial_fpr    = fp / (fp + tn + 1e-8)
+                    auc          = float(roc_auc_score(y_v, probs))
 
-                mlflow.log_metric("OOT_FPR", trial_fpr)
-                mlflow.log_metric("OOT_AUC", auc)
-                logger.info("mlp_xgboost encoder trial %d — FPR: %.4f  AUC: %.4f",
-                            trial.number, trial_fpr, auc)
-        return trial_fpr
+                    mlflow.log_metric("OOT_FPR", trial_fpr)
+                    mlflow.log_metric("OOT_AUC", auc)
+                    logger.info("%s encoder trial %d — FPR: %.4f  AUC: %.4f",
+                                model_type, trial.number, trial_fpr, auc)
+                    return trial_fpr
+
+                except Exception as exc:
+                    logger.warning("Trial %d failed: %s", trial.number, exc)
+                    return 1.0  # penalise failed trials
 
     return objective
 
 
 def _train_final_encoder(
+    model_type: str,
     X_train: np.ndarray,
     y_train: np.ndarray,
     X_test: np.ndarray,
@@ -511,43 +525,63 @@ def _train_final_encoder(
     combined_params: Dict[str, Any],
     fpr_threshold: float,
     device: str,
+    card1_train: Optional[np.ndarray] = None,
+    card1_test: Optional[np.ndarray] = None,
 ):
-    """Train final MLP encoder on the full dev set (Phase A3).
-
-    Returns encoder_model (MLPEncoder). XGBoost trained here is discarded.
-    """
-    encoder, _ = train_mlp_xgboost(
-        X_train, y_train, X_test, y_test,
-        params=combined_params, fpr_threshold=fpr_threshold,
-        device=device, save_path=None,
-    )
-    return encoder
+    """Retrain final encoder on full dev set (Phase A3). Returns encoder/artifact."""
+    if model_type == "mlp_xgboost":
+        encoder, _ = train_mlp_xgboost(
+            X_train, y_train, X_test, y_test,
+            params=combined_params, fpr_threshold=fpr_threshold,
+            device=device, save_path=None,
+        )
+        return encoder
+    elif model_type == "transformer_xgboost":
+        encoder, _ = train_transformer_xgboost(
+            X_train, y_train, X_test, y_test,
+            params=combined_params, fpr_threshold=fpr_threshold,
+            device=device, save_path=None,
+        )
+        return encoder
+    else:  # gnn_xgboost
+        artifact, _ = train_gnn_xgboost(
+            X_train, y_train, X_test, y_test,
+            card1_train=card1_train, card1_test=card1_test,
+            params=combined_params, fpr_threshold=fpr_threshold,
+            device="cpu", save_path=None,
+        )
+        return artifact
 
 
 def _extract_combined_matrix(
-    encoder_model,
+    model_type: str,
+    encoder_or_artifact,
     X_train: np.ndarray,
     X_test: np.ndarray,
-    device: str = "cpu",
-):
-    """Extract [original_features || MLP_embeddings] from a frozen encoder.
-
-    Returns (X_combined_train, X_combined_test, n_original_features).
-    """
+    device: str,
+    card1_train: Optional[np.ndarray] = None,
+    card1_test: Optional[np.ndarray] = None,
+) -> Tuple[np.ndarray, np.ndarray, int]:
+    """Extract [orig || encoder_embeddings] for Phase B."""
     n_orig = X_train.shape[1]
-    embed_train = extract_mlp_embeddings(encoder_model, X_train, device=device)
-    embed_test  = extract_mlp_embeddings(encoder_model, X_test,  device=device)
+    if model_type == "mlp_xgboost":
+        emb_train = extract_mlp_embeddings(encoder_or_artifact, X_train, device=device)
+        emb_test  = extract_mlp_embeddings(encoder_or_artifact, X_test,  device=device)
+    elif model_type == "transformer_xgboost":
+        emb_train = extract_transformer_embeddings(encoder_or_artifact, X_train, device=device)
+        emb_test  = extract_transformer_embeddings(encoder_or_artifact, X_test,  device=device)
+    else:  # gnn_xgboost
+        emb_train = extract_gnn_embeddings(encoder_or_artifact, X_train, card1_train, device="cpu")
+        emb_test  = extract_gnn_embeddings(encoder_or_artifact, X_test,  card1_test,  device="cpu")
+    return (
+        np.concatenate([X_train, emb_train], axis=1),
+        np.concatenate([X_test,  emb_test],  axis=1),
+        n_orig,
+    )
 
-    X_combined_train = np.concatenate([X_train, embed_train], axis=1)
-    X_combined_test  = np.concatenate([X_test,  embed_test],  axis=1)
-    return X_combined_train, X_combined_test, n_orig
 
-
-# ---------------------------------------------------------------------------
-# Hybrid pipeline (MLP+XGBoost)
-# ---------------------------------------------------------------------------
-
-def _run_hybrid_pipeline(
+def _run_neural_hybrid_pipeline(
+    model_type: str,
     X_train: np.ndarray,
     y_train: np.ndarray,
     X_test: np.ndarray,
@@ -559,31 +593,37 @@ def _run_hybrid_pipeline(
     parent_run_id: str,
     device: str,
     cfg: Dict[str, Any],
+    card1_train: Optional[np.ndarray] = None,
+    card1_test: Optional[np.ndarray] = None,
 ) -> tuple:
-    """Two-phase MLP+XGBoost tuning pipeline."""
-    encoder_n_trials   = model_tuning.get("encoder_n_trials", n_trials)
-    n_cv_folds         = model_tuning.get("cv_folds", 3)
-    cv_fold_weights    = model_tuning.get("cv_fold_weights",
-                                          list(range(1, n_cv_folds + 1)))
+    """Generic two-phase neural hybrid tuning: Phase A (encoder HPO) + Phase B (XGBoost HPO)."""
+    _sample_enc_fn_map = {
+        "mlp_xgboost":          _sample_mlp_encoder_params,
+        "transformer_xgboost":  _sample_transformer_encoder_params,
+        "gnn_xgboost":          _sample_gnn_encoder_params,
+    }
+    sample_enc_fn     = _sample_enc_fn_map[model_type]
+    encoder_n_trials  = model_tuning.get("encoder_n_trials", n_trials)
+    n_cv_folds        = model_tuning.get("cv_folds", 3)
+    cv_fold_weights   = model_tuning.get("cv_fold_weights", list(range(1, n_cv_folds + 1)))
     early_stopping_rds = model_tuning.get("early_stopping_rounds", 50)
-    rfe_stability_k    = model_tuning.get("rfe_stability_k", 2.0)
+    rfe_stability_k   = model_tuning.get("rfe_stability_k", 2.0)
     variance_threshold = model_tuning.get("variance_threshold", 0.03)
-    n_features_min     = model_tuning.get("rfe_n_features_min", 20)
-    rfe_step           = model_tuning.get("rfe_step", 10)
-    retune_n_trials    = model_tuning.get("retune_n_trials", max(n_trials // 2, 20))
-    base_study_name    = model_tuning.get("study_name", "mlp_xgboost_fraud_tuning")
+    n_features_min    = model_tuning.get("rfe_n_features_min", 20)
+    rfe_step          = model_tuning.get("rfe_step", 10)
+    retune_n_trials   = model_tuning.get("retune_n_trials", max(n_trials // 2, 20))
+    base_study_name   = model_tuning.get("study_name", f"{model_type}_fraud_tuning")
+    fixed_xgb_params  = cfg.get("xgboost_params", {})
 
-    fixed_xgb_params = cfg.get("xgboost_params", {})
-
-    # Phase A — Encoder HPO
-    logger.info("=== Phase A: Encoder HPO — %d trials, OOT FPR objective ===",
-                encoder_n_trials)
-    enc_objective = _build_hybrid_encoder_objective(
-        X_train, y_train, X_test, y_test,
-        fixed_xgb_params=fixed_xgb_params,
-        fpr_threshold=fpr_threshold,
-        parent_run_id=parent_run_id,
-        device=device,
+    # ---- Phase A: Encoder HPO ----
+    logger.info("=== Phase A: %s encoder HPO — %d trials ===", model_type, encoder_n_trials)
+    enc_objective = _build_neural_encoder_objective(
+        model_type=model_type,
+        X_train=X_train, y_train=y_train, X_test=X_test, y_test=y_test,
+        fixed_xgb_params=fixed_xgb_params, fpr_threshold=fpr_threshold,
+        parent_run_id=parent_run_id, device=device,
+        sample_enc_fn=sample_enc_fn,
+        card1_train=card1_train, card1_test=card1_test,
     )
     enc_study = optuna.create_study(
         direction="minimize",
@@ -593,40 +633,37 @@ def _run_hybrid_pipeline(
     )
     enc_study.optimize(enc_objective, n_trials=encoder_n_trials, show_progress_bar=True)
 
-    best_encoder_params = _resolve_encoder_params("mlp_xgboost", enc_study.best_params)
+    best_encoder_params = _resolve_encoder_params(model_type, enc_study.best_params)
     mlflow.log_metric("phaseA_best_OOT_FPR", enc_study.best_value)
     mlflow.set_tag("phaseA_best_trial", enc_study.best_trial.number)
     logger.info("Phase A complete. Best OOT FPR=%.4f (trial %d)",
                 enc_study.best_value, enc_study.best_trial.number)
 
-    # Phase A3 — Final encoder training on full dev set
-    logger.info("=== Phase A3: Final encoder training (full dev set) ===")
-    combined_for_a3 = {**fixed_xgb_params, **best_encoder_params}
-    encoder_model = _train_final_encoder(
-        X_train, y_train, X_test, y_test,
-        combined_params=combined_for_a3,
-        fpr_threshold=fpr_threshold,
-        device=device,
+    # ---- Phase A3: Final encoder on full dev set ----
+    logger.info("=== Phase A3: Final %s encoder training (full dev set) ===", model_type)
+    combined_for_a3   = {**fixed_xgb_params, **best_encoder_params}
+    encoder_model     = _train_final_encoder(
+        model_type=model_type,
+        X_train=X_train, y_train=y_train, X_test=X_test, y_test=y_test,
+        combined_params=combined_for_a3, fpr_threshold=fpr_threshold, device=device,
+        card1_train=card1_train, card1_test=card1_test,
     )
     logger.info("Phase A3 complete. Encoder frozen.")
 
-    # Phase B — XGBoost on frozen combined-feature matrix
+    # ---- Phase B: XGBoost on frozen embeddings ----
     logger.info("=== Phase B: Extract embeddings → L2 RFE → XGBoost re-HPO ===")
-
     X_comb_train, X_comb_test, n_original_features = _extract_combined_matrix(
-        encoder_model, X_train, X_test, device,
+        model_type=model_type, encoder_or_artifact=encoder_model,
+        X_train=X_train, X_test=X_test, device=device,
+        card1_train=card1_train, card1_test=card1_test,
     )
-    logger.info(
-        "Combined matrix: train=%s  test=%s  (orig=%d  embed=%d)",
-        X_comb_train.shape, X_comb_test.shape,
-        n_original_features, X_comb_train.shape[1] - n_original_features,
-    )
-    mlflow.log_param("phaseB_combined_features",    X_comb_train.shape[1])
-    mlflow.log_param("phaseB_n_original_features",  n_original_features)
+    logger.info("Combined matrix: train=%s  test=%s  (orig=%d  embed=%d)",
+                X_comb_train.shape, X_comb_test.shape,
+                n_original_features, X_comb_train.shape[1] - n_original_features)
+    mlflow.log_param("phaseB_combined_features",   X_comb_train.shape[1])
+    mlflow.log_param("phaseB_n_original_features", n_original_features)
 
     cv_folds = _make_temporal_cv_folds(month_arr, n_folds=n_cv_folds)
-    logger.info("Phase B CV: %d folds, weights=%s", len(cv_folds), cv_fold_weights)
-
     rfe_xgb_params = {
         "n_estimators":   fixed_xgb_params.get("n_estimators", 300),
         "learning_rate":  fixed_xgb_params.get("learning_rate", 0.05),
@@ -644,37 +681,28 @@ def _run_hybrid_pipeline(
         early_stopping_rds, stability_k=rfe_stability_k,
     )
     mlflow.log_param("phaseB_n_selected", len(l2_combined_indices))
-    logger.info("Phase B1 complete. Selected %d combined features.",
-                len(l2_combined_indices))
 
     l2_feat_idx = np.array(l2_combined_indices)
     logger.info("=== Phase B2: XGBoost re-HPO — %d features, %d trials ===",
                 len(l2_combined_indices), retune_n_trials)
     stage2_study = _run_xgb_study(
         X_comb_train, y_train, cv_folds, cv_fold_weights,
-        early_stopping_rds, fpr_threshold,
-        n_trials=retune_n_trials,
-        study_name=base_study_name + "_stage2",
-        parent_run_id=parent_run_id,
+        early_stopping_rds, fpr_threshold, n_trials=retune_n_trials,
+        study_name=base_study_name + "_stage2", parent_run_id=parent_run_id,
         feature_idx=l2_feat_idx,
     )
     best_xgb_stage2_params = dict(stage2_study.best_params)
     best_xgb_stage2_params["tree_method"] = "hist"
     best_xgb_stage2_params["eval_metric"] = "auc"
     mlflow.log_metric("phaseB2_best_weighted_FPR", stage2_study.best_value)
-    mlflow.set_tag("phaseB2_best_trial", stage2_study.best_trial.number)
-    logger.info("Phase B2 complete. Best weighted FPR=%.4f (trial %d)",
-                stage2_study.best_value, stage2_study.best_trial.number)
 
     logger.info("=== Phase B3: Stability gate (threshold=%.3f) ===", variance_threshold)
     final_fold_fprs = _cv_xgb_fold_fprs(
         X_comb_train, y_train, cv_folds, best_xgb_stage2_params,
         fpr_threshold, early_stopping_rds, feature_idx=l2_feat_idx,
     )
-    cv_mean     = float(np.mean(final_fold_fprs))
-    cv_std      = float(np.std(final_fold_fprs))
-    cv_variance = float(np.var(final_fold_fprs))
-
+    cv_mean, cv_std = float(np.mean(final_fold_fprs)), float(np.std(final_fold_fprs))
+    cv_variance     = float(np.var(final_fold_fprs))
     mlflow.log_metric("phaseB_final_CV_FPR_mean",     cv_mean)
     mlflow.log_metric("phaseB_final_CV_FPR_std",      cv_std)
     mlflow.log_metric("phaseB_final_CV_FPR_variance", cv_variance)
@@ -687,18 +715,24 @@ def _run_hybrid_pipeline(
         logger.info("Phase B3 PASSED: var=%.4f < %.3f  (mean=%.4f  std=%.4f)",
                     cv_variance, variance_threshold, cv_mean, cv_std)
     else:
-        logger.warning(
-            "Phase B3 FAILED: var=%.4f >= %.3f  (mean=%.4f  std=%.4f).",
-            cv_variance, variance_threshold, cv_mean, cv_std,
-        )
+        logger.warning("Phase B3 FAILED: var=%.4f >= %.3f  (mean=%.4f  std=%.4f).",
+                       cv_variance, variance_threshold, cv_mean, cv_std)
 
     return (best_encoder_params, best_xgb_stage2_params,
             l2_combined_indices, n_original_features, stage2_study)
 
 
 # ---------------------------------------------------------------------------
-# Config write-back
+# Config write-back (local YAML + optional S3)
 # ---------------------------------------------------------------------------
+
+def _upload_config_to_s3(local_path: Path, s3_bucket: str, s3_key: str) -> None:
+    """Upload config YAML to S3 for zero-code scheduled retraining."""
+    import boto3  # optional dependency; only imported when S3 writeback is active
+    s3 = boto3.client("s3")
+    s3.upload_file(str(local_path), s3_bucket, s3_key)
+    logger.info("Config uploaded to s3://%s/%s", s3_bucket, s3_key)
+
 
 def _write_best_params_to_config(
     best_params: Dict[str, Any],
@@ -708,14 +742,21 @@ def _write_best_params_to_config(
     stage2_params: Optional[Dict[str, Any]] = None,
     l2_indices: Optional[List[int]] = None,
 ) -> None:
-    """Overwrite the model-specific params block in model_config.yaml."""
+    """Overwrite model-specific params in model_config.yaml and optionally push to S3.
+
+    S3 upload is triggered when the S3_CONFIG_BUCKET environment variable is set.
+    The S3 object key defaults to 'configs/model_config.yaml' and can be
+    overridden via S3_CONFIG_KEY.
+    """
     path = Path(config_path) if config_path else _CONFIG_PATH
     with open(path, "r") as f:
         cfg = yaml.safe_load(f)
 
     yaml_key_map = {
-        "xgboost":     "xgboost_params",
-        "mlp_xgboost": "mlp_xgboost_params",
+        "xgboost":            "xgboost_params",
+        "mlp_xgboost":        "mlp_xgboost_params",
+        "transformer_xgboost": "transformer_xgboost_params",
+        "gnn_xgboost":        "gnn_xgboost_params",
     }
     yaml_key = yaml_key_map[model_type]
 
@@ -726,14 +767,21 @@ def _write_best_params_to_config(
     if selected_features is not None:
         cfg["xgboost_selected_features"] = selected_features
 
-    stage2_key_map = {"mlp_xgboost": "mlp_xgboost_stage2_params"}
-    l2_key_map     = {"mlp_xgboost": "mlp_xgboost_selected"}
+    stage2_key_map = {
+        "mlp_xgboost":        "mlp_xgboost_stage2_params",
+        "transformer_xgboost": "transformer_xgboost_stage2_params",
+        "gnn_xgboost":        "gnn_xgboost_stage2_params",
+    }
+    l2_key_map = {
+        "mlp_xgboost":        "mlp_xgboost_selected",
+        "transformer_xgboost": "transformer_xgboost_selected",
+        "gnn_xgboost":        "gnn_xgboost_selected",
+    }
 
     if stage2_params is not None:
         s2_key = stage2_key_map.get(model_type)
         if s2_key:
-            cfg[s2_key] = {k: v for k, v in stage2_params.items()
-                           if k not in skip_keys}
+            cfg[s2_key] = {k: v for k, v in stage2_params.items() if k not in skip_keys}
     if l2_indices is not None:
         l2_key = l2_key_map.get(model_type)
         if l2_key:
@@ -750,13 +798,19 @@ def _write_best_params_to_config(
         logger.info("Hybrid L2 RFE: %d combined indices → %s",
                     len(l2_indices), l2_key_map.get(model_type, "?"))
 
+    # Optional S3 writeback — enables zero-code scheduled retraining
+    s3_bucket = os.environ.get("S3_CONFIG_BUCKET", "")
+    if s3_bucket:
+        s3_key = os.environ.get("S3_CONFIG_KEY", "configs/model_config.yaml")
+        try:
+            _upload_config_to_s3(path, s3_bucket, s3_key)
+        except Exception as exc:
+            logger.warning("S3 config upload failed (non-fatal): %s", exc)
+
 
 # ---------------------------------------------------------------------------
 # Orchestrator
 # ---------------------------------------------------------------------------
-
-VALID_MODELS = ("xgboost", "mlp_xgboost")
-
 
 def run_tuning(
     trans_path: str,
@@ -765,14 +819,14 @@ def run_tuning(
     n_trials: int = 50,
     model_type: str = "xgboost",
 ) -> optuna.Study:
-    """Orchestrate the full tuning run for XGBoost or MLP+XGBoost."""
+    """Orchestrate the full tuning run for any supported model type."""
     if model_type not in VALID_MODELS:
         raise ValueError(f"model_type must be one of {VALID_MODELS}, got '{model_type}'")
 
-    cfg          = load_config(config_path)
-    training_cfg = cfg["training"]
-    tuning_cfg   = cfg.get("tuning", {})
-    model_tuning = tuning_cfg.get(model_type, {})
+    cfg           = load_config(config_path)
+    training_cfg  = cfg["training"]
+    tuning_cfg    = cfg.get("tuning", {})
+    model_tuning  = tuning_cfg.get(model_type, {})
     fpr_threshold = cfg["serving"]["fraud_threshold_prob"]
 
     mlflow.set_tracking_uri(training_cfg["mlflow_tracking_uri"])
@@ -784,6 +838,10 @@ def run_tuning(
 
     X_train_raw, y_train = X.loc[train_idx], y.loc[train_idx].values
     X_test_raw,  y_test  = X.loc[test_idx],  y.loc[test_idx].values
+
+    # card1 needed for GNN neighbourhood construction
+    card1_train = X_train_raw["card1"].values if "card1" in X_train_raw.columns else None
+    card1_test  = X_test_raw["card1"].values  if "card1" in X_test_raw.columns  else None
 
     logger.info("Fitting feature pipeline once on %d training samples...", len(X_train_raw))
     pipeline = get_full_pipeline()
@@ -804,9 +862,7 @@ def run_tuning(
         mlflow.log_param("n_features",     X_train.shape[1])
         mlflow.log_param("fpr_threshold",  fpr_threshold)
 
-        month_arr = np.floor(
-            X_train_raw["TransactionDT"].values / SECONDS_IN_MONTH
-        )
+        month_arr = np.floor(X_train_raw["TransactionDT"].values / SECONDS_IN_MONTH)
 
         if model_type == "xgboost":
             best, selected_features, study = _run_xgb_pipeline(
@@ -815,15 +871,14 @@ def run_tuning(
                 parent_run_id=parent_run.info.run_id,
             )
             _write_best_params_to_config(
-                best, model_type, config_path,
-                selected_features=selected_features,
+                best, model_type, config_path, selected_features=selected_features,
             )
 
-        else:  # mlp_xgboost — two-phase hybrid pipeline
+        else:  # neural hybrid
             (best_encoder_params, best_xgb_stage2_params,
-             l2_indices, _n_orig, study) = _run_hybrid_pipeline(
-                X_train=X_train, y_train=y_train,
-                X_test=X_test, y_test=y_test,
+             l2_indices, _n_orig, study) = _run_neural_hybrid_pipeline(
+                model_type=model_type,
+                X_train=X_train, y_train=y_train, X_test=X_test, y_test=y_test,
                 month_arr=month_arr,
                 fpr_threshold=fpr_threshold,
                 model_tuning=model_tuning,
@@ -831,6 +886,8 @@ def run_tuning(
                 parent_run_id=parent_run.info.run_id,
                 device=device,
                 cfg=cfg,
+                card1_train=card1_train,
+                card1_test=card1_test,
             )
             _write_best_params_to_config(
                 best_encoder_params, model_type, config_path,
@@ -852,14 +909,13 @@ if __name__ == "__main__":
         format="%(asctime)s %(levelname)s %(name)s - %(message)s",
     )
     parser = argparse.ArgumentParser(
-        description="Tune XGBoost or MLP+XGBoost via Optuna + OOT evaluation."
+        description="Tune fraud detection model via Optuna + OOT evaluation."
     )
     parser.add_argument("--trans",   required=True, help="Path to raw transaction CSV")
     parser.add_argument("--id",      required=True, help="Path to raw identity CSV")
     parser.add_argument("--config",  default=None,
                         help="Path to YAML config (default: configs/model_config.yaml)")
-    parser.add_argument("--model",   default="xgboost",
-                        choices=list(VALID_MODELS),
+    parser.add_argument("--model",   default="xgboost", choices=list(VALID_MODELS),
                         help="Model to tune (default: xgboost)")
     parser.add_argument("--trials",  type=int, default=50,
                         help="Number of Optuna trials (default: 50)")
