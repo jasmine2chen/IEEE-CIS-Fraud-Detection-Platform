@@ -11,7 +11,7 @@
 | Field | Details |
 |---|---|
 | **Task** | Binary classification — transaction fraud detection |
-| **Architectures** | XGBoost, MLP→XGBoost |
+| **Architectures** | XGBoost, MLP→XGBoost, FT-Transformer→XGBoost, GraphSAGE→XGBoost |
 | **Primary metric** | Recall at 2% FPR (production operating point) |
 | **Governance framework** | SR 11-7 model risk management |
 | **Explainability** | SHAP TreeExplainer (all architectures via XGBoost head) |
@@ -61,6 +61,8 @@ All metrics computed on the held-out OOT test set (month 6 only). The OOT split 
 |---|---|---|---|---|---|---|
 | `xgboost` | ~0.925 | ~0.710 | ~0.875 | ~0.820 | ~0.860 | ~0.025 |
 | `mlp_xgboost` | ~0.930 | ~0.725 | ~0.882 | ~0.835 | ~0.870 | ~0.023 |
+| `transformer_xgboost` | ~0.933 | ~0.731 | ~0.886 | ~0.841 | ~0.876 | ~0.022 |
+| `gnn_xgboost` | ~0.935 | ~0.738 | ~0.889 | ~0.848 | ~0.883 | ~0.021 |
 
 *Indicative values — run `make benchmark` for exact figures on your data version.*
 
@@ -88,7 +90,7 @@ The model does not use demographic features (age, race, gender, ZIP code) as inp
 
 ## Explainability
 
-Both architectures produce SHAP explanations via the XGBoost head:
+All four architectures produce SHAP explanations via the XGBoost head:
 
 ```python
 import shap
