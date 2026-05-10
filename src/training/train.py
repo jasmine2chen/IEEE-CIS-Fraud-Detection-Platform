@@ -32,6 +32,7 @@ import joblib
 import mlflow
 import mlflow.sklearn
 import mlflow.xgboost
+from mlflow.models import infer_signature
 import numpy as np
 import pandas as pd
 import torch
@@ -133,6 +134,9 @@ def _train_xgboost(cfg, X_train, y_train, X_test, y_test, amounts=None) -> None:
                     len(feature_idx), feature_idx.max() + 1)
         mlflow.log_param("n_selected_features", len(feature_idx))
 
+    # autolog captures all booster params + per-round eval metrics automatically.
+    # log_models=False so we control artifact path via log_model below.
+    mlflow.xgboost.autolog(log_models=False, log_datasets=False, silent=True)
     mlflow.log_params(xgb_params)
     mlflow.set_tag("model_type", "xgboost")
     mlflow.log_param("fpr_threshold", fpr_threshold)
@@ -164,7 +168,8 @@ def _train_xgboost(cfg, X_train, y_train, X_test, y_test, amounts=None) -> None:
     os.makedirs("models", exist_ok=True)
     model.set_params(eval_metric=None)  # closure can't be pickled; metric only needed during training
     joblib.dump(model, "models/xgboost_fraud_model.joblib")
-    mlflow.xgboost.log_model(model, artifact_path=CANONICAL_XGB_ARTIFACT["xgboost"])
+    signature = infer_signature(X_test[:5], preds[:5])
+    mlflow.xgboost.log_model(model, artifact_path=CANONICAL_XGB_ARTIFACT["xgboost"], signature=signature)
     logger.info("XGBoost model saved.")
 
 
@@ -246,7 +251,8 @@ def _train_mlp_xgboost(cfg, X_train, y_train, X_test, y_test, amounts=None) -> N
     logger.info("MLP+XGBoost OOT AUC: %.4f", auc)
     mlflow.log_metric("OOT_AUC", auc)
     _log_fraud_metrics(y_v, preds, amounts=amounts)
-    mlflow.xgboost.log_model(xgb_model, artifact_path=CANONICAL_XGB_ARTIFACT["mlp_xgboost"])
+    signature = infer_signature(X_sel_test[:5], preds[:5])
+    mlflow.xgboost.log_model(xgb_model, artifact_path=CANONICAL_XGB_ARTIFACT["mlp_xgboost"], signature=signature)
 
 
 def _train_transformer_xgboost(cfg, X_train, y_train, X_test, y_test, amounts=None) -> None:
@@ -321,7 +327,8 @@ def _train_transformer_xgboost(cfg, X_train, y_train, X_test, y_test, amounts=No
     logger.info("Transformer+XGBoost OOT AUC: %.4f", auc)
     mlflow.log_metric("OOT_AUC", auc)
     _log_fraud_metrics(y_v, preds, amounts=amounts)
-    mlflow.xgboost.log_model(xgb_model, artifact_path=CANONICAL_XGB_ARTIFACT["transformer_xgboost"])
+    signature = infer_signature(X_sel_test[:5], preds[:5])
+    mlflow.xgboost.log_model(xgb_model, artifact_path=CANONICAL_XGB_ARTIFACT["transformer_xgboost"], signature=signature)
 
 
 def _train_gnn_xgboost(
@@ -403,7 +410,8 @@ def _train_gnn_xgboost(
     logger.info("GNN+XGBoost OOT AUC: %.4f", auc)
     mlflow.log_metric("OOT_AUC", auc)
     _log_fraud_metrics(y_v, preds, amounts=amounts)
-    mlflow.xgboost.log_model(xgb_model, artifact_path=CANONICAL_XGB_ARTIFACT["gnn_xgboost"])
+    signature = infer_signature(X_sel_test[:5], preds[:5])
+    mlflow.xgboost.log_model(xgb_model, artifact_path=CANONICAL_XGB_ARTIFACT["gnn_xgboost"], signature=signature)
 
 
 # ---------------------------------------------------------------------------

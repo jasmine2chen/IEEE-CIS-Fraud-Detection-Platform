@@ -1,0 +1,33 @@
+# Lean API image — no CUDA, CPU-only torch for encoder loading.
+# Result: ~900MB vs ~4GB for the full training image.
+FROM python:3.11-slim AS builder
+
+WORKDIR /app
+
+RUN apt-get update && apt-get install -y build-essential curl && rm -rf /var/lib/apt/lists/*
+
+COPY requirements/base.txt requirements/api.txt ./requirements/
+RUN pip install --no-cache-dir -r requirements/api.txt
+
+# ----- Production stage -----
+FROM python:3.11-slim
+
+WORKDIR /app
+
+RUN useradd --create-home appuser
+
+COPY --from=builder /usr/local/lib/python3.11/site-packages /usr/local/lib/python3.11/site-packages
+COPY --from=builder /usr/local/bin /usr/local/bin
+
+COPY src/ ./src/
+COPY configs/ ./configs/
+
+RUN mkdir -p /app/models && chown -R appuser:appuser /app
+
+USER appuser
+
+EXPOSE 8000
+
+ENV WORKERS=4
+
+CMD uvicorn src.deployment.api.main:app --host 0.0.0.0 --port 8000 --workers $WORKERS

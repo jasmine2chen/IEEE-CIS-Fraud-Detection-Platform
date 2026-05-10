@@ -1,0 +1,6 @@
+-r base.txt
+torch==2.8.0
+optuna==4.2.1
+prefect==3.1.7
+evidently==0.4.33
+psycopg2-binary==2.9.9

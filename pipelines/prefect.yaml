@@ -1,0 +1,75 @@
+name: fraud-detection
+prefect-version: "3.1.7"
+
+# Build / push steps are handled by the CD pipeline (docker/Dockerfile.training → ECR).
+build: null
+push: null
+
+pull:
+  - prefect.deployments.steps.set_working_directory:
+      directory: /app
+
+deployments:
+
+  - name: xgboost-weekly
+    entrypoint: pipelines/training_pipeline.py:training_pipeline
+    work_pool:
+      name: fraud-detection-pool
+    schedules:
+      - cron: "0 2 * * 1"   # every Monday 02:00 UTC
+        timezone: "UTC"
+    parameters:
+      model_type: xgboost
+      n_trials: 50
+      auto_promote: true
+    tags: [xgboost, scheduled]
+
+  - name: mlp-xgboost-weekly
+    entrypoint: pipelines/training_pipeline.py:training_pipeline
+    work_pool:
+      name: fraud-detection-pool
+    schedules:
+      - cron: "0 4 * * 1"   # Monday 04:00 UTC (after xgboost run)
+        timezone: "UTC"
+    parameters:
+      model_type: mlp_xgboost
+      n_trials: 50
+      auto_promote: true
+    tags: [mlp_xgboost, scheduled]
+
+  - name: transformer-xgboost-weekly
+    entrypoint: pipelines/training_pipeline.py:training_pipeline
+    work_pool:
+      name: fraud-detection-pool
+    schedules:
+      - cron: "0 6 * * 1"   # Monday 06:00 UTC
+        timezone: "UTC"
+    parameters:
+      model_type: transformer_xgboost
+      n_trials: 30
+      auto_promote: true
+    tags: [transformer_xgboost, scheduled]
+
+  - name: gnn-xgboost-weekly
+    entrypoint: pipelines/training_pipeline.py:training_pipeline
+    work_pool:
+      name: fraud-detection-pool
+    schedules:
+      - cron: "0 8 * * 1"   # Monday 08:00 UTC
+        timezone: "UTC"
+    parameters:
+      model_type: gnn_xgboost
+      n_trials: 25
+      auto_promote: true
+    tags: [gnn_xgboost, scheduled]
+
+  - name: drift-triggered-retrain
+    entrypoint: pipelines/training_pipeline.py:training_pipeline
+    work_pool:
+      name: fraud-detection-pool
+    # No schedule — triggered by SNS/CloudWatch alarm via Prefect API or EventBridge
+    parameters:
+      model_type: xgboost
+      n_trials: 30
+      auto_promote: false   # human review required for drift-triggered retraining
+    tags: [drift-triggered]

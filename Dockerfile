@@ -8,8 +8,8 @@ RUN apt-get update && apt-get install -y \
     curl \
     && rm -rf /var/lib/apt/lists/*
 
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+COPY requirements/base.txt requirements/api.txt ./requirements/
+RUN pip install --no-cache-dir -r requirements/api.txt
 
 # ----- Production stage -----
 FROM python:3.9-slim
@@ -22,6 +22,7 @@ RUN useradd --create-home appuser
 # Copy installed packages from builder
 COPY --from=builder /usr/local/lib/python3.9/site-packages /usr/local/lib/python3.9/site-packages
 COPY --from=builder /usr/local/bin /usr/local/bin
+COPY --from=builder /app/requirements ./requirements
 
 # Copy application source
 COPY src/ ./src/

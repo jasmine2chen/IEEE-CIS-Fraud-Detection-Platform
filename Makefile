@@ -1,6 +1,6 @@
-.PHONY: install test lint tune train tune-then-train register promote \
-        batch-score monitor run-api docker-build docker-run \
-        pipeline-run stack-up stack-down \
+.PHONY: install install-api install-training test lint tune train tune-then-train register promote \
+        batch-score monitor run-api docker-build docker-build-api docker-build-training docker-run \
+        pipeline-run prefect-deploy stack-up stack-down \
         benchmark ablation
 
 MODEL   ?= xgboost
@@ -12,8 +12,16 @@ ABL_OUT   ?= reports/ablation
 
 install:
 	python -m pip install -U pip
-	pip install -r requirements.txt
+	pip install -r requirements/dev.txt
 	pre-commit install
+
+install-api:
+	python -m pip install -U pip
+	pip install -r requirements/api.txt
+
+install-training:
+	python -m pip install -U pip
+	pip install -r requirements/training.txt
 
 test:
 	python -m pytest tests/ -v --tb=short
@@ -85,13 +93,21 @@ pipeline-run:
 run-api:
 	uvicorn src.deployment.api.main:app --reload --host 0.0.0.0 --port 8000
 
-docker-build:
-	docker build -t fraud_detection_api:latest .
+docker-build: docker-build-api
+
+docker-build-api:
+	docker build -f docker/Dockerfile.api -t fraud_detection_api:latest .
+
+docker-build-training:
+	docker build -f docker/Dockerfile.training -t fraud_detection_training:latest .
 
 docker-run:
 	docker run -p 8000:8000 \
 		-e MLFLOW_TRACKING_URI=http://host.docker.internal:5000 \
 		fraud_detection_api:latest
+
+prefect-deploy:
+	prefect deploy --all --prefect-file pipelines/prefect.yaml
 
 stack-up:
 	docker compose up -d

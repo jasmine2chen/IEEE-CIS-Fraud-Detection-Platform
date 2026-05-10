@@ -1,0 +1,28 @@
+# Full training image — includes PyTorch (CUDA), Optuna, Prefect, Evidently.
+# Use a GPU instance type (g4dn, p3) on ECS or EC2 for neural encoder training.
+FROM python:3.11-slim AS builder
+
+WORKDIR /app
+
+RUN apt-get update && apt-get install -y build-essential curl && rm -rf /var/lib/apt/lists/*
+
+COPY requirements/base.txt requirements/training.txt ./requirements/
+RUN pip install --no-cache-dir -r requirements/training.txt
+
+# ----- Production stage -----
+FROM python:3.11-slim
+
+WORKDIR /app
+
+COPY --from=builder /usr/local/lib/python3.11/site-packages /usr/local/lib/python3.11/site-packages
+COPY --from=builder /usr/local/bin /usr/local/bin
+
+COPY src/ ./src/
+COPY configs/ ./configs/
+COPY pipelines/ ./pipelines/
+
+RUN mkdir -p /app/data/raw /app/models
+
+EXPOSE 4200
+
+CMD ["python", "-m", "src.training.train"]
