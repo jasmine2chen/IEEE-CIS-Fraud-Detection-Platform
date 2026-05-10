@@ -40,4 +40,4 @@ EXPOSE 8000
 ENV WORKERS=4
 
 # Use $WORKERS for horizontal concurrency; override at runtime with -e WORKERS=N
-CMD uvicorn src.deployment.api.main:app --host 0.0.0.0 --port 8000 --workers $WORKERS
+CMD uvicorn src.serving.api.main:app --host 0.0.0.0 --port 8000 --workers $WORKERS

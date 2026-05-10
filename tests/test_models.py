@@ -2,7 +2,7 @@ import numpy as np
 import pytest
 import torch
 
-from src.training.models.mlp_tree import EarlyStopping, FocalLoss, MLPEncoder, train_mlp_xgboost
+from src.models.mlp_tree import EarlyStopping, FocalLoss, MLPEncoder, train_mlp_xgboost
 
 
 def test_mlp_encoder_forward():

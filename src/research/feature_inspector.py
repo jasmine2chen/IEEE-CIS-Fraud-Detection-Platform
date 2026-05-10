@@ -7,7 +7,7 @@ research engineers hand to stakeholders.
 
 Usage
 -----
-    from src.research_tools.feature_inspector import (
+    from src.research.feature_inspector import (
         feature_target_correlation,
         text_feature_audit,
         embedding_visualization,

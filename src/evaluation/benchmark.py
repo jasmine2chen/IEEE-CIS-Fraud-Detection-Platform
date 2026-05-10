@@ -34,14 +34,14 @@ import numpy as np
 import pandas as pd
 
 from src.config import load_config
-from src.preprocessing.data_loader import prepare_data
+from src.data.loader import prepare_data
 from src.evaluation.metrics import (
     evaluate_classification,
     fpr_sweep,
     auc_at_max_fpr,
 )
-from src.feature_engineering.build_features import get_full_pipeline
-from src.deployment import registry
+from src.data.features import get_full_pipeline
+from src.serving import registry
 
 logger = logging.getLogger(__name__)
 
@@ -139,7 +139,7 @@ def _load_encoder(model_type: str) -> Optional[Any]:
         if not Path(encoder_path).exists():
             return None
         import torch
-        from src.training.models.mlp_tree import MLPEncoder
+        from src.models.mlp_tree import MLPEncoder
         ckpt = torch.load(encoder_path, map_location="cpu", weights_only=False)
         enc  = MLPEncoder(
             input_dim=ckpt["input_dim"],
@@ -154,7 +154,7 @@ def _load_encoder(model_type: str) -> Optional[Any]:
         if not Path(encoder_path).exists():
             return None
         import torch
-        from src.training.models.transformer_tree import TabTransformerEncoder
+        from src.models.transformer_tree import TabTransformerEncoder
         ckpt = torch.load(encoder_path, map_location="cpu", weights_only=False)
         enc  = TabTransformerEncoder(
             input_dim=ckpt["input_dim"],
@@ -176,7 +176,7 @@ def _load_encoder(model_type: str) -> Optional[Any]:
         logger.warning("GNN encoder artifacts missing — returning None.")
         return None
     import torch
-    from src.training.models.gnn_tree import GraphSAGEEncoder, GNNArtifact
+    from src.models.gnn_tree import GraphSAGEEncoder, GNNArtifact
     ckpt = torch.load(enc_path, map_location="cpu", weights_only=False)
     enc  = GraphSAGEEncoder(
         input_dim=ckpt["input_dim"],
@@ -209,13 +209,13 @@ def _build_input(
         return X_proc
 
     if model_type == "mlp_xgboost":
-        from src.training.models.mlp_tree import extract_mlp_embeddings
+        from src.models.mlp_tree import extract_mlp_embeddings
         embeddings = extract_mlp_embeddings(encoder, X_proc, device="cpu")
     elif model_type == "transformer_xgboost":
-        from src.training.models.transformer_tree import extract_transformer_embeddings
+        from src.models.transformer_tree import extract_transformer_embeddings
         embeddings = extract_transformer_embeddings(encoder, X_proc, device="cpu")
     else:  # gnn_xgboost
-        from src.training.models.gnn_tree import extract_gnn_embeddings, GNNArtifact
+        from src.models.gnn_tree import extract_gnn_embeddings, GNNArtifact
         card1_values = (
             X_raw["card1"].values
             if X_raw is not None and "card1" in X_raw.columns

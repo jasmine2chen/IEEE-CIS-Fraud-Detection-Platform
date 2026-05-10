@@ -1,6 +1,6 @@
 import pandas as pd
-from src.preprocessing.data_loader import clean_data
-from src.feature_engineering.build_features import build_features
+from src.data.loader import clean_data
+from src.data.features import build_features
 
 def test_clean_data(sample_data):
     """Test data cleaning removes extreme NaNs."""

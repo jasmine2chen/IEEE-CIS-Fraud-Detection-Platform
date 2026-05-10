@@ -24,9 +24,9 @@ import joblib
 import mlflow
 import pandas as pd
 
-from src.deployment import registry
+from src.serving import registry
 from src.config import load_config
-from src.preprocessing.data_loader import prepare_data
+from src.data.loader import prepare_data
 
 logger = logging.getLogger(__name__)
 

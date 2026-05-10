@@ -17,9 +17,9 @@ from fastapi.middleware.cors import CORSMiddleware
 from prometheus_fastapi_instrumentator import Instrumentator
 
 from src.config import load_config
-from src.deployment.registry import load_champion, load_challenger, get_model_name
-from src.deployment import registry as _registry
-from src.deployment.api.schemas import (
+from src.serving.registry import load_champion, load_challenger, get_model_name
+from src.serving import registry as _registry
+from src.serving.api.schemas import (
     TransactionRequest,
     BatchTransactionRequest,
     PredictionResponse,
@@ -78,7 +78,7 @@ def _load_encoder_from_disk(model_type: str) -> Optional[object]:
         if not enc_path.exists():
             return None
         import torch
-        from src.training.models.mlp_tree import MLPEncoder
+        from src.models.mlp_tree import MLPEncoder
         ckpt = torch.load(str(enc_path), map_location="cpu", weights_only=False)
         enc  = MLPEncoder(
             input_dim=ckpt["input_dim"],
@@ -93,7 +93,7 @@ def _load_encoder_from_disk(model_type: str) -> Optional[object]:
         if not enc_path.exists():
             return None
         import torch
-        from src.training.models.transformer_tree import TabTransformerEncoder
+        from src.models.transformer_tree import TabTransformerEncoder
         ckpt = torch.load(str(enc_path), map_location="cpu", weights_only=False)
         enc  = TabTransformerEncoder(
             input_dim=ckpt["input_dim"],
@@ -114,7 +114,7 @@ def _load_encoder_from_disk(model_type: str) -> Optional[object]:
     if not all(p.exists() for p in [enc_path, h0_path, h1_path]):
         return None
     import torch
-    from src.training.models.gnn_tree import GraphSAGEEncoder, GNNArtifact
+    from src.models.gnn_tree import GraphSAGEEncoder, GNNArtifact
     ckpt = torch.load(str(enc_path), map_location="cpu", weights_only=False)
     enc  = GraphSAGEEncoder(
         input_dim=ckpt["input_dim"],
@@ -247,9 +247,9 @@ def _build_enriched_input(
         return X_proc
 
     # Determine encoder type and extract embeddings
-    from src.training.models.gnn_tree import GNNArtifact
+    from src.models.gnn_tree import GNNArtifact
     if isinstance(encoder_or_artifact, GNNArtifact):
-        from src.training.models.gnn_tree import extract_gnn_embeddings
+        from src.models.gnn_tree import extract_gnn_embeddings
         card1_values = df["card1"].values if "card1" in df.columns else None
         embeddings = extract_gnn_embeddings(
             encoder_or_artifact, X_proc, card1_values, device="cpu"
@@ -257,15 +257,15 @@ def _build_enriched_input(
     else:
         # MLPEncoder or TabTransformerEncoder — duck-type via embed_dim attribute
         try:
-            from src.training.models.transformer_tree import TabTransformerEncoder
+            from src.models.transformer_tree import TabTransformerEncoder
             if isinstance(encoder_or_artifact, TabTransformerEncoder):
-                from src.training.models.transformer_tree import extract_transformer_embeddings
+                from src.models.transformer_tree import extract_transformer_embeddings
                 embeddings = extract_transformer_embeddings(encoder_or_artifact, X_proc, device="cpu")
             else:
-                from src.training.models.mlp_tree import extract_mlp_embeddings
+                from src.models.mlp_tree import extract_mlp_embeddings
                 embeddings = extract_mlp_embeddings(encoder_or_artifact, X_proc, device="cpu")
         except Exception:
-            from src.training.models.mlp_tree import extract_mlp_embeddings
+            from src.models.mlp_tree import extract_mlp_embeddings
             embeddings = extract_mlp_embeddings(encoder_or_artifact, X_proc, device="cpu")
 
     return np.hstack([X_proc, embeddings])
@@ -485,4 +485,4 @@ async def predict_shadow(
 
 
 if __name__ == "__main__":
-    uvicorn.run("src.deployment.api.main:app", host="0.0.0.0", port=8000, reload=True)
+    uvicorn.run("src.serving.api.main:app", host="0.0.0.0", port=8000, reload=True)

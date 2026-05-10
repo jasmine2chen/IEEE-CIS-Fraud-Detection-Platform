@@ -385,7 +385,7 @@ def train_mlp_xgboost(
     Returns:
         (encoder, xgb_model): MLPEncoder + fitted XGBClassifier.
     """
-    from src.training.models.tree_models import get_xgboost_model
+    from src.models.tree_models import get_xgboost_model
 
     if params is None:
         params = {}

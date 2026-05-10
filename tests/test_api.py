@@ -2,7 +2,7 @@ import pytest
 import pandas as pd
 import numpy as np
 from fastapi.testclient import TestClient
-from src.deployment.api.main import app, get_prediction_artifacts
+from src.serving.api.main import app, get_prediction_artifacts
 
 class MockPipeline:
     """Mimics a fitted sklearn Pipeline: accepts a raw DataFrame, returns a feature array."""
@@ -105,7 +105,7 @@ def test_transaction_id_echoed():
 
 def test_auth_rejected_when_api_key_set(monkeypatch):
     """Requests without a valid X-API-Key must be rejected when API_KEY is configured."""
-    import src.deployment.api.main as api_module
+    import src.serving.api.main as api_module
     monkeypatch.setattr(api_module, "_API_KEY", "secret-key")
 
     response = client.post("/predict", json={

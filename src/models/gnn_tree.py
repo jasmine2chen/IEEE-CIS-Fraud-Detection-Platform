@@ -61,7 +61,7 @@ import torch.optim as optim
 from sklearn.metrics import roc_auc_score
 from torch.utils.data import DataLoader, TensorDataset
 
-from src.training.models.mlp_tree import EarlyStopping, FocalLoss
+from src.models.mlp_tree import EarlyStopping, FocalLoss
 
 logger = logging.getLogger(__name__)
 
@@ -443,7 +443,7 @@ def train_gnn_xgboost(
     Returns:
         (gnn_artifact, xgb_model): GNNArtifact + fitted XGBClassifier.
     """
-    from src.training.models.tree_models import get_xgboost_model
+    from src.models.tree_models import get_xgboost_model
 
     if params is None:
         params = {}

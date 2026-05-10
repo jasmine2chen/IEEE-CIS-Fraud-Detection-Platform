@@ -7,7 +7,7 @@ wall-clock duration for every experiment, with zero boilerplate at the call site
 
 Usage
 -----
-    from src.research_tools.experiment_logger import research_run, log_feature_importance
+    from src.research.experiment_logger import research_run, log_feature_importance
 
     with research_run("fraud_ablation", "no_uid_aggs", config=cfg) as run:
         mlflow.log_metric("roc_auc", 0.95)

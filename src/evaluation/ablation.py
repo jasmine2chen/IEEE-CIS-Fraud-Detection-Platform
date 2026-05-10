@@ -40,11 +40,11 @@ import numpy as np
 import pandas as pd
 
 from src.config import load_config
-from src.preprocessing.data_loader import prepare_data
+from src.data.loader import prepare_data
 from src.training.train import time_consistency_split
 from src.evaluation.metrics import evaluate_classification, fpr_sweep
-from src.feature_engineering.build_features import get_full_pipeline
-from src.training.models.tree_models import get_xgboost_model
+from src.data.features import get_full_pipeline
+from src.models.tree_models import get_xgboost_model
 
 logger = logging.getLogger(__name__)
 

@@ -63,12 +63,12 @@ from sklearn.metrics import roc_auc_score
 from xgboost import XGBClassifier
 
 from src.config import load_config
-from src.preprocessing.data_loader import prepare_data
-from src.feature_engineering.build_features import get_full_pipeline
-from src.training.models.mlp_tree import extract_mlp_embeddings, train_mlp_xgboost
-from src.training.models.transformer_tree import extract_transformer_embeddings, train_transformer_xgboost
-from src.training.models.gnn_tree import GNNArtifact, extract_gnn_embeddings, train_gnn_xgboost
-from src.training.models.tree_models import make_fpr_eval_metric
+from src.data.loader import prepare_data
+from src.data.features import get_full_pipeline
+from src.models.mlp_tree import extract_mlp_embeddings, train_mlp_xgboost
+from src.models.transformer_tree import extract_transformer_embeddings, train_transformer_xgboost
+from src.models.gnn_tree import GNNArtifact, extract_gnn_embeddings, train_gnn_xgboost
+from src.models.tree_models import make_fpr_eval_metric
 from src.training.train import time_consistency_split
 
 SECONDS_IN_MONTH = 2_592_000

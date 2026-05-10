@@ -19,7 +19,7 @@ from typing import Optional
 import mlflow
 from prefect import flow, task, get_run_logger
 
-from src.deployment import registry
+from src.serving import registry
 from src.config import load_config
 from src.training.train import train
 from src.training.tune import run_tuning
